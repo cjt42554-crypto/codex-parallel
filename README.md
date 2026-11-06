@@ -1,6 +1,7 @@
 # codex-parallel
 
-**Parallel Codex CLI tasks, with a terminal workflow monitor.**  
+**Parallel Codex CLI tasks, with a terminal workflow monitor.**
+
 **Codex CLI 并行任务调度器，让每个 EXEC 的状态、提示词和回答都可见。**
 
 Run independent **Codex CLI (`codex exec`)** tasks in parallel from a JSON task manifest. Set a model and reasoning effort for each task, bound concurrency, retry transient failures, and inspect batch results in an interactive terminal UI (TUI).

@@ -1,0 +1,7 @@
+interface:
+  display_name: "Codex 并行调度"
+  short_description: "批量并行运行独立 Codex EXEC 任务，支持并发控制、执行记录与失败重试"
+  default_prompt: "使用 $codex-parallel 把这项工作拆成独立任务并行完成，汇总结果和失败项。"
+
+policy:
+  allow_implicit_invocation: true

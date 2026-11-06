@@ -1,0 +1,40 @@
+#!/usr/bin/python3
+"""codex exec: subscription by default, explicit --api for one API-backed run."""
+import json
+import os
+from pathlib import Path
+import sys
+
+args = sys.argv[1:]
+if args and args[0] in ('--wrapper-help',):
+    print('codexexec [--sub|--api] [codex exec arguments...]\n'
+          'Default: saved ChatGPT subscription. --api: official API for this run.\n'
+          'Place --api or --sub first. Other arguments pass through to codex exec.')
+    raise SystemExit(0)
+use_api = bool(args and args[0] == '--api')
+if args and args[0] in ('--api', '--sub'):
+    args = args[1:]
+env = os.environ.copy()
+# Explicit channel selection takes precedence over inherited key overrides.
+env.pop('CODEX_API_KEY', None)
+env.pop('OPENAI_API_KEY', None)
+env.pop('OPENAI_BASE_URL', None)
+if use_api:
+    try:
+        key = (Path.home()/'.config/codexexec/api-key').read_text().strip()
+        if not key:
+            raise ValueError('empty key')
+    except (OSError, ValueError):
+        sys.exit('codexexec: API key missing; subscription fallback is disabled.')
+    env['CODEX_API_KEY'] = key
+else:
+    auth_dir = Path(env.get('CODEX_HOME', str(Path.home()/'.codex')))
+    try:
+        auth = json.loads((auth_dir/'auth.json').read_text())
+    except (OSError, ValueError):
+        sys.exit('codexexec: saved subscription login unavailable; run codex login.')
+    if auth.get('auth_mode') != 'chatgpt':
+        sys.exit('codexexec: saved login is not ChatGPT subscription; refusing API fallback.')
+# No login command is run; persistent auth and the user's config are preserved.
+codex = str(Path.home()/'.local/bin/codex')
+os.execve(codex, [codex, 'exec', '-c', 'model_provider="openai"', *args], env)

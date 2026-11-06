@@ -14,6 +14,7 @@ import unittest
 SOURCE = Path(__file__).resolve().parents[1] / 'scripts'
 if not (SOURCE / 'dispatch.py').exists():
     SOURCE = Path(__file__).resolve().parent
+sys.path.insert(0, str(SOURCE))
 
 FAKE = r'''#!/usr/bin/env python3
 import json,sys,time
@@ -28,6 +29,7 @@ sys.stdin.read()
 print(json.dumps({'type':'turn.started'}),flush=True)
 if mode=='hang':time.sleep(30)
 if mode=='slow':time.sleep(3)
+if mode=='brief':time.sleep(.3)
 if mode in ('transient','transient_tool','quota'):
  if mode=='transient_tool':print(json.dumps({'type':'item.started','item':{'type':'command_execution'}}),flush=True)
  print(json.dumps({'type':'turn.failed','error':{'code':'insufficient_quota' if mode=='quota' else 'server_is_overloaded'}}),flush=True)
@@ -49,6 +51,9 @@ class DispatchFixture(unittest.TestCase):
         self.base = Path(self.temp.name)
         self.scripts = self.base / 'scripts';self.scripts.mkdir()
         shutil.copy2(SOURCE / 'dispatch.py', self.scripts / 'dispatch.py')
+        for helper in ('batch_control.py', 'task_control.py', 'process_ownership.py'):
+            if (SOURCE / helper).exists():
+                shutil.copy2(SOURCE / helper, self.scripts / helper)
         (self.scripts / 'monitor_registry.py').write_text('from pathlib import Path\ndef registry_directory():\n p=Path('+repr(str(self.base/'registry'))+');p.mkdir(exist_ok=True);return p\n')
         (self.scripts / 'codexexec').write_text(FAKE);(self.scripts / 'codexexec').chmod(0o755)
         self.procs=[]
@@ -122,7 +127,13 @@ class DispatchTests(DispatchFixture):
         self.assertIn('active dispatcher',self.run_cli().stderr)
         time.sleep(3.2)
         self.behavior(self.root,{})
-        self.assertEqual(self.run_cli().returncode,0);self.assertEqual(self.receipt()['status'],'complete')
+        self.assertEqual(self.run_cli().returncode,0)
+        self.assertEqual(self.receipt()['attempt'],1)
+        report=json.loads(self.run_cli('--report').stdout)
+        self.assertFalse(report['ok'])
+        self.assertEqual(report['counts'],{'interrupted':1})
+        self.assertEqual(self.run_cli('--retry-failed').returncode,0)
+        self.assertEqual(self.receipt()['status'],'complete')
         self.assertEqual(self.receipt()['attempt'],2)
 
     def test_corrupt_receipt_and_unwritable_task_do_not_stop_peers(self):
@@ -132,9 +143,12 @@ class DispatchTests(DispatchFixture):
         (w/'file').write_text('not a directory')
         self.assertEqual(self.run_cli().returncode,0)
         self.assertEqual(self.receipt()['status'],'complete')
-        self.assertEqual(self.receipt('bad')['status'],'failed')
+        self.assertEqual((w/'bad/receipt.json').read_text(),'{corrupt')
+        self.assertFalse((w/'bad/started').exists())
         status=json.loads((self.root/'status-tasks.json').read_text())
         final=json.loads(Path(status['summary_path']).read_text())
+        self.assertEqual(final['results']['bad']['status'],'interrupted')
+        self.assertEqual(final['results']['bad']['recovery_state'],'unknown')
         self.assertEqual(final['results']['file']['status'],'failed')
         self.assertIn('receipt_error',final['results']['file'])
 
@@ -164,8 +178,11 @@ class DispatchTests(DispatchFixture):
         self.jobs(self.root,ids);self.behavior(self.root,{i:i for i in ids if i!='a'})
         self.assertEqual(self.run_cli('--concurrency','9','--ramp-seconds','0','--timeout-seconds','1').returncode,0)
         for i in ids:
-            expected=i if i in ('partial','blocked') else 'complete' if i=='a' else 'failed'
+            expected=i if i in ('partial','blocked') else 'complete' if i=='a' else 'blocked' if i in ('missing','bad_schema') else 'failed'
             with self.subTest(i=i):self.assertEqual(self.receipt(i)['status'],expected)
+        for i in ('missing','bad_schema'):
+            self.assertEqual(self.receipt(i)['execution'],'succeeded')
+            self.assertEqual(self.receipt(i)['reported_status'],'unknown')
         r=self.receipt('failed_turn');self.assertIsNone(r['turn_completed_utc']);self.assertTrue(r['turn_failed_utc'])
         self.assertEqual(self.receipt('hang')['last_error'],'worker deadline exceeded')
 
@@ -173,7 +190,7 @@ class DispatchTests(DispatchFixture):
         self.behavior(self.root,{'a':'partial'});self.assertEqual(self.run_cli().returncode,0)
         w=self.root/'workers/a';original=(w/'result-01.json').read_bytes()
         self.assertEqual(self.run_cli().returncode,0);self.assertEqual(self.receipt()['attempt'],1)
-        self.behavior(self.root,{'a':'missing'})
+        self.behavior(self.root,{'a':'nonzero'})
         self.assertEqual(self.run_cli('--retry-failed').returncode,0)
         self.assertEqual(self.receipt()['status'],'failed');self.assertEqual(self.receipt()['result_file'],'result-02.json')
         self.assertEqual((w/'result-01.json').read_bytes(),original);self.assertFalse((w/'result.json').exists())
@@ -200,6 +217,7 @@ class DispatchTests(DispatchFixture):
     def test_legacy_receipt_verification(self):
         self.assertEqual(self.run_cli().returncode,0)
         r=self.receipt();r.pop('input_fingerprint');r.pop('result_file')
+        (self.root/'workers/a/receipt-01.json').unlink()
         (self.root/'workers/a/receipt.json').write_text(json.dumps(r))
         self.assertEqual(self.run_cli().returncode,0);self.assertEqual(self.receipt()['attempt'],1)
         r.pop('command');(self.root/'workers/a/receipt.json').write_text(json.dumps(r))

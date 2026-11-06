@@ -5,58 +5,47 @@ description: 用本地 Codex EXEC 队列批量并行执行独立任务，支持�
 
 # Codex 并行调度
 
-主代理定义任务边界、提交一份清单、处理汇总中的异常。调度器负责排队、限流、重试和收集结果，不自动拆任务。大量同类任务用脚本生成清单；过小的工作可合并为一个任务，减少进程和上下文开销。
+主代理定义任务、提交清单、处理异常并验收共同产物。调度器负责排队、限流、重试和收集结果。大量同类任务可用脚本生成清单；小任务可合并。默认采纳子任务报告，只在异常、必要抽查或集成验收时查看具体证据。
 
-默认采纳子任务报告，不逐项重做或复审。只在异常、必要抽查或共同产物的集成检查时打开具体任务；不要逐个轮询 worker 或把全部日志读回主对话。每次启动与重试都会显式传入模型和推理强度。
+## 定义并提交
 
-## 提交
-
-`$SKILL` 为本 SKILL.md 所在目录，`$RUN` 为本批次独立工作目录。
+`$SKILL` 为本文件所在目录，`$RUN` 为任务工作区。
 
 ```bash
 python3 "$SKILL/scripts/dispatch.py" --run-dir "$RUN" --init
 ```
 
-把简短共享上下文写入 `$RUN/COMMON.md`，任务写入 `$RUN/tasks.json`：
+把共享背景写入 `COMMON.md`，把独立任务写入 `tasks.json`：
 
 ```json
 {
   "defaults": {"model": "gpt-6.1-sol", "effort": "high"},
   "tasks": [
-    {"id": "module-a", "prompt": "输入绝对路径、工作范围、产物及验收要求。"},
+    {"id": "module-a", "prompt": "写明输入绝对路径、范围、产物和验收要求。"},
     {"id": "module-b", "effort": "medium", "prompt": "另一个可独立推进的任务。"}
   ]
 }
 ```
 
-任务字段覆盖 defaults；title 可省略。仍兼容每项完整指定配置的旧式数组清单。模型和推理强度必须由清单明确给出。
-
-worker 仅获得 COMMON 与自己的 prompt，不继承主对话。默认在 `workers/<id>/` 工作；修改项目时为任务指定 `write_dirs` 绝对路径数组，并分配互不重叠的文件。目录写权限不提供文件锁或工作树隔离。worker 默认关闭 apps、嵌套多代理、记忆、浏览器、电脑操作和网页搜索。
+每次启动和重试都要显式指定模型与推理强度，可由 defaults 提供，任务可覆盖。worker 只收到共享背景与自己的提示词。需要改项目时，用 `write_dirs` 指定可写目录并划分互不重叠的文件。
 
 ```bash
-python3 "$SKILL/scripts/dispatch.py" --run-dir "$RUN" --concurrency 16
+python3 "$SKILL/scripts/dispatch.py" --submit --run-dir "$RUN"
 ```
 
-默认并发为 8，逐步提升到设置的上限；内存不足时暂停新启动。并发量按机器与账号容量选择，大清单不意味着同时启动所有任务。调度命令持续运行到结束；主代理可在此期间做独立工作。
+提交返回启动状态、`run_id` 和绝对路径 `batch_id`。检查启动状态，再保存 `batch_id` 作为 `$BATCH`；后续始终用它定位这次调用。
 
-## 收结果
+## 等待并收结果
+
+第一次等待前把 `CURSOR` 设为 0。
 
 ```bash
-python3 "$SKILL/scripts/dispatch.py" --run-dir "$RUN" --status
-python3 "$SKILL/scripts/dispatch.py" --run-dir "$RUN" --report
-python3 "$SKILL/scripts/dispatch.py" --run-dir "$RUN" --results --attention
+python3 "$SKILL/scripts/dispatch.py" --batch "$BATCH" --wait --after "$CURSOR" --wait-seconds 60
+python3 "$SKILL/scripts/dispatch.py" --batch "$BATCH" --report
 ```
 
-运行中按需看 status，结束先看 report：状态计数、复用数量、自动重试次数、待处理项及结果索引路径。成功且无问题的任务不需要逐项打开。`--results --attention` 分页读取异常；`--results --offset 20 --limit 20` 读取下一页完整结果。需要合并所有产物时，用脚本处理 report 指向的 `results.jsonl`，无需读取每个 worker 的提示词和日志。
+下一次等待传回上次返回的 `cursor`。等待在出现待处理项、批次结束、调度进程失联或到达等待时限时返回。等待超时后，批次继续运行；主代理可以先做独立工作，再回来等待。不要逐个轮询 worker；终端面板供人查看，当前没有自动唤醒主对话的机制。
 
-默认标准输出仅给出开始与结束状态；自动面板使用系统默认终端，跨批次复用一个总览。日志、逐次回执和完整结果保存在运行目录。
+运行中需要产物时，用独立的结果游标 `--results --after RESULT_CURSOR --limit 20` 增量读取终态任务；加 `--attention` 只看待处理项。等待会越过普通成功项，因此不要拿等待游标代替完整结果游标。批次结束后先看 report 的 `ok`、计数与异常预览，按需读取证据或整合产物，把获授权的工作跟进到验收。遇到失联或取消，先核对真实状态与清理情况。
 
-## 继续与重试
-
-相同输入再次运行会复用已有终态；修改输入或执行配置时必须换任务 ID 或目录，防止错用旧结果。仅重跑指定未完成任务：
-
-```bash
-python3 "$SKILL/scripts/dispatch.py" --run-dir "$RUN" --only module-a --retry-failed
-```
-
-每次重跑是新的 EXEC，会保留旧尝试证据。明确的暂时性服务/连接错误默认最多自动重试 2 次，并退避；观察到工具执行后默认停止自动重试。partial、blocked、超时和格式错误不自动重试。需要调整重试策略、通道、权限或运行参数时，读 [执行参数与产物](references/execution.md)。
+批次没有总时限；默认每次尝试也不限时，静默只告警。取消、重跑、兼容命令及高级参数见[执行参数与产物](references/execution.md)。

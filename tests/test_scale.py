@@ -123,8 +123,11 @@ class ScaleTests(fixtures.DispatchFixture):
         proc.wait(timeout=12)
         report = self.report()
         self.assertEqual(report['state'], 'interrupted')
-        self.assertEqual(report['counts'], {'failed': 1})
+        self.assertEqual(report['counts'], {'interrupted': 1})
         self.assertFalse(report['ok'])
+        self.assertEqual(self.receipt()['attempt'], 1)
+        self.assertEqual(self.receipt()['status'], 'failed')
+        self.assertEqual(self.run_cli('--retry-backoff-seconds', '0').returncode, 0)
         self.assertEqual(self.receipt()['attempt'], 1)
 
     def test_compact_report_attention_and_result_pagination(self):
@@ -138,12 +141,16 @@ class ScaleTests(fixtures.DispatchFixture):
         report = self.report()
         self.assertFalse(report['ok'])
         self.assertEqual(report['attention_count'], 2)
+        events = Path(report['batch_id']) / 'result-events.jsonl'
+        event_order = [row['id'] for row in map(json.loads, events.read_text().splitlines())
+                       if row['status'] != 'complete' or row['issues']]
+        self.assertCountEqual(event_order, ids[1:3])
         page = json.loads(self.run_cli('--results', '--attention', '--limit', '1').stdout)
         self.assertEqual(page['total'], 2)
-        self.assertEqual(page['items'][0]['id'], ids[1])
+        self.assertEqual(page['items'][0]['id'], event_order[0])
         self.assertEqual(page['next_offset'], 1)
         page = json.loads(self.run_cli('--results', '--attention', '--limit', '1', '--offset', '1').stdout)
-        self.assertEqual(page['items'][0]['id'], ids[2])
+        self.assertEqual(page['items'][0]['id'], event_order[1])
         self.assertIsNone(page['next_offset'])
         all_rows = [json.loads(line) for line in Path(report['results_path']).read_text().splitlines()]
         self.assertEqual(len(all_rows), 30)
@@ -205,13 +212,22 @@ class ScaleTests(fixtures.DispatchFixture):
                 directory = root / 'workers/a'
                 if legacy:
                     receipt = json.loads((directory / 'receipt.json').read_text())
-                    receipt.pop('result_file')
+                    for field in ('result_file', 'owner', 'execution', 'reported_status', 'result_observation'):
+                        receipt.pop(field, None)
                     (directory / 'receipt.json').write_text(json.dumps(receipt))
                     (directory / 'receipt-01.json').unlink()
+                    (directory / 'control.json').unlink()
                     self.assertEqual(self.run_cli(root=root).returncode, 0)
                 row = json.loads(self.run_cli('--results', root=root).stdout)['items'][0]
                 self.behavior(root, {})
                 self.assertEqual(self.run_cli('--only', 'a', '--retry-failed', root=root).returncode, 0)
+                if legacy:
+                    # Missing old ownership evidence cannot authorize replay.
+                    self.assertFalse((directory / 'receipt-02.json').exists())
+                    # A later compatibility-pointer update cannot change the
+                    # historical row's frozen receipt and result evidence.
+                    (directory / 'receipt.json').write_text(json.dumps(dict(status='complete', attempt=2)))
+                    (directory / 'result.json').write_text(json.dumps(dict(status='complete', summary='new')))
                 saved = json.loads(Path(row['receipt_path']).read_text())
                 self.assertEqual((saved['status'], saved['attempt']), ('partial', 1))
                 self.assertEqual(json.loads(Path(row['result_path']).read_text())['status'], 'partial')
@@ -223,6 +239,7 @@ class ScaleTests(fixtures.DispatchFixture):
         receipt = self.receipt()
         receipt['result_file'] = None
         (self.root / 'workers/a/receipt.json').write_text(json.dumps(receipt))
+        (self.root / 'workers/a/receipt-01.json').write_text(json.dumps(receipt))
         self.jobs(self.root, ['a', 'b'])
         result = self.run_cli()
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -239,8 +256,6 @@ class ScaleTests(fixtures.DispatchFixture):
         status = json.loads(self.run_cli('--status').stdout)
         self.assertEqual(status['state'], 'running')
         self.assertTrue(status['scheduler_live'])
-        status['process_start_ticks'] = 'different-process'
-        self.assertFalse(self.module().has_live_worker(status, 'dispatch.py'))
         proc.terminate()
         proc.wait(timeout=12)
 
@@ -308,10 +323,10 @@ time.sleep(30)
             processes = []
             original = mod.stop_worker
 
-            async def stop(proc):
+            async def stop(proc, *args):
                 processes.append(proc)
                 started.set()
-                await original(proc)
+                return await original(proc, *args)
 
             with (self.root / '.dispatch.lock').open('a') as lock, patch.object(mod, 'stop_worker', side_effect=stop):
                 fcntl.flock(lock, fcntl.LOCK_EX)

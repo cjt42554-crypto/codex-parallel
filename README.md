@@ -58,10 +58,14 @@ cp "$SKILL/examples/tasks.json" "$RUN/tasks.json"
 先编辑 `$RUN/tasks.json`，将 `YOUR_MODEL_ID` 替换为你可用的模型，再执行：
 
 ```bash
-python3 "$SKILL/scripts/dispatch.py" --run-dir "$RUN" --concurrency 2
+SUBMISSION=$(python3 "$SKILL/scripts/dispatch.py" --submit --run-dir "$RUN" --concurrency 2)
+printf '%s\n' "$SUBMISSION"
+BATCH=$(printf '%s\n' "$SUBMISSION" | python3 -c 'import json, sys; print(json.load(sys.stdin)["batch_id"])')
 ```
 
-这一步会调用真实模型，使用对应订阅或 API 额度。示例任务只在各自 worker 目录创建小文件。
+`--submit` 启动独立的后台调度进程。保存返回的 `batch_id`（批次目录的绝对路径），后续等待、查询和取消都可用它指定本次调用。`starting` 表示调度器尚未确认就绪；`startup_failed` 时查看返回的 `error` 和 `log_path`。省略 `--submit` 可在前台运行，命令会等到批次结束。
+
+提交会调用真实模型，使用对应订阅或 API 额度。示例任务只在各自 worker 目录创建小文件。
 
 清单支持对象形式，也兼容完整指定配置的旧式数组：
 
@@ -80,15 +84,27 @@ python3 "$SKILL/scripts/dispatch.py" --run-dir "$RUN" --concurrency 2
 ## 查看结果
 
 ```bash
-python3 "$SKILL/scripts/dispatch.py" --run-dir "$RUN" --status
-python3 "$SKILL/scripts/dispatch.py" --run-dir "$RUN" --report
-python3 "$SKILL/scripts/dispatch.py" --run-dir "$RUN" --results --attention
-python3 "$SKILL/scripts/dispatch.py" --run-dir "$RUN" --results --offset 20 --limit 20
+WAIT_CURSOR=0
+RESULT_CURSOR=0
+python3 "$SKILL/scripts/dispatch.py" --batch "$BATCH" --wait --after "$WAIT_CURSOR" --wait-seconds 60
+python3 "$SKILL/scripts/dispatch.py" --batch "$BATCH" --status
+python3 "$SKILL/scripts/dispatch.py" --batch "$BATCH" --report
+python3 "$SKILL/scripts/dispatch.py" --batch "$BATCH" --results --after "$RESULT_CURSOR" --limit 20
 ```
 
-`report.json` 提供计数、复用和自动重试情况，以及需要关注的任务。`results.jsonl` 保存各任务摘要、产物、问题及证据路径。超过 20 个任务时，结束时的终端报告采用精简形式；具体失败项通过 `--results --attention` 查看。
+`--wait` 在出现待处理项、批次进入终态或等待超时时返回；普通成功不会单独触发返回，等待超时不会停止批次。收到 `terminal` 时查看 `state`，区分正常结束、中断、启动失败和调度器失联。继续等待时，把该命令返回的 `cursor` 赋给 `WAIT_CURSOR`。`--results` 在运行中和结束后都可翻页，可加 `--attention` 只看待处理项；将它返回的 `cursor` 单独赋给 `RESULT_CURSOR`，避免跳过尚未读取的普通成功项。
 
-**退出码 0 表示调度过程正常结束，不代表全部任务成功。** 自动化调用应检查 `report.ok`、`counts` 和 `attention_count`。任务可以正常返回 `blocked` 或 `partial`，进程退出码仍为 0。
+`--run-dir "$RUN" --status` 是按清单查询的兼容入口。它分别报告最近提交（包括启动失败）和当前活跃批次，二者可能不同。用 `--batch "$BATCH"` 可固定查询同一次调用。
+
+批次结束后，`report.json` 提供计数、复用、重试和待处理项概览；`results.jsonl` 保存完整结果与证据路径。**退出码 0 表示命令正常返回；批次 `state: complete` 表示调度结束。** 验收应检查报告的 `ok`、`counts` 和 `attention_count`。如果已核实执行成功，但结果文件缺失或无效，会保留 `execution: succeeded` 并通过 `result_observation` 报告证据问题。这类尝试会进入待处理列表，重试时仍复用已有执行。
+
+## 取消批次
+
+```bash
+python3 "$SKILL/scripts/dispatch.py" --batch "$BATCH" --cancel --wait-seconds 60
+```
+
+取消必须显式指定 `--batch`。命令先保存取消请求并关闭该批次当前拥有的重试计划，再停止调度器和可核实归属的本机进程。检查返回的 `stopped`、`outcome` 和清理范围；若为 `cleanup_pending` 或清理尚未确认，继续用同一句柄查状态和批次目录中的 `cancellation.json`，必要时再次发出取消请求。取消和单次尝试超时共用本机进程归属检查，覆盖仍可识别的独立进程组；远端作业、已发生的外部副作用和无法核实归属的本机进程不在可确认清理的范围内。
 
 ## 终端面板
 
@@ -125,10 +141,12 @@ alias codex-parallel-monitor='python3 "$HOME/.codex/skills/codex-parallel/script
 ## 继续与重试
 
 ```bash
-python3 "$SKILL/scripts/dispatch.py" --run-dir "$RUN" --only module-a --retry-failed
+python3 "$SKILL/scripts/dispatch.py" --submit --run-dir "$RUN" --only numbers --retry-failed
 ```
 
-相同输入再次运行会复用已有终态，`--retry-failed` 重跑未完成项；已完成任务继续复用。每次重试都是新的 EXEC，不恢复旧对话。同一 ID 的提示词或执行配置变化时，应使用新 ID 或新运行目录。
+再次提交会获得新的 `batch_id`。相同输入会复用已核实的终态；用 `--retry-failed` 可为符合条件的失败、模型声明的 `partial`/`blocked` 或中断任务开启新重试链，前提是确认旧任务已退出且可以安全重做。每次重试都是新的 EXEC，从任务输入开始，保留旧尝试证据。编号回执记录执行事实，兼容指针缺失或过时、崩溃时执行结局未核实，都不会自动授权重跑。
+
+崩溃后接管待重试的旧链会保留原有预算、策略和退避截止时间；新提交参数只用于新链。主动取消后，普通提交不会恢复已关闭的重试计划；取消旧批次也不会停止已由新批次接管的计划。同一 ID 的提示词或执行配置变化时，应使用新 ID 或新运行目录。
 
 完整参数、自动重试条件、登录通道与产物说明见 [执行参数与产物](references/execution.md)。模型输入可引用的外部文件内容不会自动纳入指纹；外部输入变化时也应使用新的任务 ID 或目录。
 
@@ -144,7 +162,7 @@ worker 使用 `workspace-write`、`approval_policy="never"`，默认关闭 apps�
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_*.py' -v
 ```
 
-测试使用临时目录、模拟 EXEC 和模拟终端启动器，无需 Codex 登录、API key 或模型调用。覆盖重复启动、错误隔离、重试、历史结果、批次汇总、面板缓存和规模行为。在本地执行上面的命令即可运行全部测试。
+当前测试套件共 89 项，使用临时目录、模拟 EXEC 和模拟终端启动器，无需 Codex 登录、API key 或模型调用。覆盖后台提交、取消及本机进程归属、重试链恢复、执行结果与证据的区分、增量分页、计时、面板和规模行为。
 
 ## 范围与当前限制
 

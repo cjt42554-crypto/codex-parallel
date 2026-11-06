@@ -1,8 +1,20 @@
 # codex-parallel
 
-A lightweight, Linux-native queue for independent **Codex EXEC** tasks, with bounded concurrency, resumable attempts, conservative retries, structured reports, and a read-only terminal monitor. Python standard library only. Unofficial community tooling; not an OpenAI product.
+**Parallel Codex CLI tasks, with a terminal workflow monitor.**  
+**Codex CLI 并行任务调度器，让每个 EXEC 的状态、提示词和回答都可见。**
 
-一个轻量的本地 Codex EXEC 批量调度器，附带终端工作流面板。主代理负责拆分任务和判断下一步，调度器负责执行清单、限制并发、保存证据和汇总异常。
+Run independent **Codex CLI (`codex exec`)** tasks in parallel from a JSON task manifest. Set a model and reasoning effort for each task, bound concurrency, retry transient failures, and inspect batch results in an interactive terminal UI (TUI).
+
+Use it as a **Codex skill** or a standalone **Python task runner** for parallel coding agents, module reviews, document processing, and independent experiments. The parent agent defines task boundaries; the queue executes the submitted tasks and collects their results.
+
+- **Batch execution:** shared defaults with per-task overrides, concurrency limits, and memory-aware queueing.
+- **Recoverable runs:** input fingerprints, per-attempt evidence, bounded retries, and structured JSON/JSONL reports.
+- **Terminal visibility:** switch between batches and inspect each task's status, prompt, and final answer without opening its execution logs.
+- **Small local footprint:** Linux-native, Python standard library only, no database or additional Python packages.
+
+一个轻量的本地 Codex CLI 并行任务调度工具，附带终端工作流面板，支持批量执行、失败重试、异常汇总和跨批次查看。适合独立模块检查、资料处理与实验任务；可作为 Codex skill 使用，也可以直接运行 Python 脚本。主代理负责拆分任务和判断下一步，调度器负责执行清单、限制并发、保存证据和汇总异常。
+
+Unofficial community tooling; not affiliated with or endorsed by OpenAI. Licensed under [MIT](LICENSE).
 
 ## 功能
 

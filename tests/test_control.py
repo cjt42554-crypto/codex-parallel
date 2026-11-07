@@ -14,6 +14,7 @@ from unittest.mock import patch
 SCRIPTS = Path(__file__).resolve().parents[1] / 'scripts'
 sys.path.insert(0, str(SCRIPTS))
 import batch_control as control
+import process_ownership as ownership
 
 
 FAKE = r'''
@@ -55,13 +56,16 @@ if args.manifest == 'invalid':
 status = dict(state='running', batch_id=str(run), run_id=run.name, manifest=args.manifest,
               pid=os.getpid(), process_start_ticks=ticks(os.getpid()), cursor=0,
               boot_id=Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
+              uid=os.geteuid(), pid_namespace=os.readlink('/proc/self/ns/pid'),
               heartbeat_utc='old on purpose', running_ids=['peer'], stalled_ids=['peer'])
 def stop(*_):
     write(run / 'status.json', {**status, 'state': 'interrupted'})
     sys.exit(0)
 signal.signal(signal.SIGTERM, stop)
-write(run / 'config.json', dict(**vars(args), sid=os.getsid(0), executable=sys.executable,
-                                stdin_closed=sys.stdin.read() == ''))
+(run / 'attempts').mkdir()
+write(run / 'config.json', {**vars(args), **status, 'jobs': ['peer'], 'attempt_journal_version': 1,
+                           'sid': os.getsid(0), 'executable': sys.executable,
+                           'stdin_closed': sys.stdin.read() == ''})
 if args.manifest == 'delayed':
     while not (run / 'ready').exists():
         time.sleep(.02)
@@ -104,7 +108,7 @@ class ControlTests(unittest.TestCase):
         with (run / 'result-events.jsonl').open('a') as stream:
             for cursor, state, issues in rows:
                 stream.write(json.dumps(dict(cursor=cursor, id=f't{cursor}', status=state,
-                                             issues=issues, summary='', artifacts=[])) + '\n')
+                                             answer=f'Answer {cursor}', issues=issues)) + '\n')
 
     def wait_until(self, predicate, timeout=4):
         end = time.monotonic() + timeout
@@ -164,36 +168,73 @@ class ControlTests(unittest.TestCase):
         self.assertEqual(again['state'], 'startup_failed')
         self.assertFalse(again['waiting_timed_out'])
 
-    def test_wait_coalesces_successes_and_expires_without_stopping(self):
+    def test_wait_delivers_successes_then_expires_without_stopping(self):
         run = Path(self.launch()['batch_id'])
         self.append_rows(run, [(1, 'complete', []), (2, 'complete', [])])
         result = control.wait_for_event(run, 0, .25)
-        self.assertTrue(result['waiting_timed_out'])
-        self.assertEqual(result['items'], [])
+        self.assertEqual(result['event'], 'result')
+        self.assertFalse(result['waiting_timed_out'])
+        self.assertEqual([row['answer'] for row in result['items']], ['Answer 1', 'Answer 2'])
         self.assertEqual(result['cursor'], 2)
+        expired = control.wait_for_event(run, result['cursor'], .25)
+        self.assertEqual((expired['event'], expired['items'], expired['cursor']), ('timeout', [], 2))
+        self.assertTrue(expired['waiting_timed_out'])
         status = control.read_status(run)
         self.assertTrue(status['scheduler_live'])
         self.assertEqual(status['stalled_ids'], ['peer'])
         (run / 'finish').touch()
-        self.assertEqual(control.wait_for_event(run, result['cursor'], 2)['state'], 'complete')
+        terminal = control.wait_for_event(run, expired['cursor'], 2)
+        self.assertEqual((terminal['event'], terminal['state'], terminal['items'], terminal['cursor']),
+                         ('terminal', 'complete', [], 2))
 
-    def test_attention_precedes_final_status_while_peer_runs(self):
+    def test_automatic_wait_remembers_task_ids_in_completion_order(self):
+        run = Path(self.launch()['batch_id'])
+        path = run / 'result-events.jsonl'
+        first = dict(cursor=1, id='task_8', status='complete', answer='first')
+        second = dict(cursor=2, id='task_2', status='complete', answer='late smaller ID')
+        path.write_text(json.dumps(first) + '\n')
+        self.assertEqual(control.wait_for_event(run, wait_seconds=0)['items'], [first])
+        self.assertEqual(control.wait_for_event(run, wait_seconds=0)['items'], [])
+        with path.open('a') as stream:
+            stream.write(json.dumps(second) + '\n')
+        self.assertEqual(control.wait_for_event(run, wait_seconds=0)['items'], [second])
+        self.assertEqual(json.loads((run / 'wait-delivered.json').read_text()),
+                         {'task_ids': ['task_2', 'task_8']})
+        # Explicit replay and inspection leave the automatic delivery record alone.
+        self.assertEqual(control.wait_for_event(run, 0, 0)['items'], [first, second])
+        self.assertEqual(control.results_page(run, after_cursor=0)['items'], [first, second])
+        self.assertEqual(control.wait_for_event(run, wait_seconds=0)['items'], [])
+
+    def test_automatic_wait_state_is_per_batch_and_respects_page_limit(self):
+        for name in ('101', '102'):
+            run = self.root / 'runs' / name
+            run.mkdir(parents=True)
+            (run / 'status.json').write_text(json.dumps(dict(state='complete', run_id=name)))
+            self.append_rows(run, [(1, 'complete', []), (2, 'complete', [])])
+            first = control.wait_for_event(run, wait_seconds=0, limit=1)
+            second = control.wait_for_event(run, wait_seconds=0, limit=1)
+            self.assertEqual([r['id'] for r in first['items'] + second['items']], ['t1', 't2'])
+            self.assertEqual(control.wait_for_event(run, wait_seconds=0)['items'], [])
+
+    def test_wait_pages_every_result_while_peer_runs(self):
         run = Path(self.launch()['batch_id'])
         self.append_rows(run, [(1, 'complete', []), (2, 'blocked', []),
                                (3, 'complete', ['review needed']), (4, 'complete', [])])
         result = control.wait_for_event(run, 0, 2, 1)
         self.assertEqual(result['state'], 'running')
-        self.assertEqual(result['event'], 'attention')
-        self.assertEqual([row['id'] for row in result['items']], ['t2'])
-        self.assertEqual(result['cursor'], 2)
+        self.assertEqual(result['event'], 'result')
+        self.assertEqual([row['id'] for row in result['items']], ['t1'])
+        self.assertEqual(result['cursor'], 1)
         self.assertEqual(control.read_status(run)['running_ids'], ['peer'])
         self.assertEqual(control.read_status(run)['cursor'], 0)  # Commit precedes the next snapshot.
-        second = control.wait_for_event(run, result['cursor'], 0, 1)
-        self.assertEqual([row['id'] for row in second['items']], ['t3'])
+        second = control.wait_for_event(run, result['cursor'], 0, 2)
+        self.assertEqual([row['id'] for row in second['items']], ['t2', 't3'])
         self.assertEqual(second['cursor'], 3)
-        self.assertEqual(control.wait_for_event(run, second['cursor'], 0)['cursor'], 4)
+        last = control.wait_for_event(run, second['cursor'], 0)
+        self.assertEqual([row['id'] for row in last['items']], ['t4'])
+        self.assertEqual(last['cursor'], 4)
 
-    def test_cursor_and_offset_pagination_do_not_skip_results(self):
+    def test_cursor_pagination_does_not_skip_results(self):
         run = Path(self.launch()['batch_id'])
         self.append_rows(run, [(1, 'complete', []), (2, 'failed', []), (3, 'complete', []),
                                (4, 'partial', []), (5, 'complete', [])])
@@ -203,17 +244,15 @@ class ControlTests(unittest.TestCase):
         self.assertEqual((page['cursor'], page['high_watermark']), (2, 5))
         next_page = control.results_page(run, after_cursor=page['cursor'], limit=2)
         self.assertEqual([row['id'] for row in next_page['items']], ['t3', 't4'])
-        selected = control.results_page(run, attention=True, offset=1, limit=1)
+        selected = control.results_page(run, after_cursor=page['cursor'], attention=True, limit=1)
         self.assertEqual([row['id'] for row in selected['items']], ['t4'])
         self.assertEqual(selected['total'], 2)
-        self.assertIsNone(selected['next_offset'])
-        self.assertEqual(control.results_page(run, limit=2)['next_offset'], 2)
 
-    def test_wait_retries_partial_tail_and_stops_at_attention_limit(self):
+    def test_wait_retries_partial_tail_and_stops_at_result_limit(self):
         run = Path(self.launch()['batch_id'])
         path = run / 'result-events.jsonl'
         self.append_rows(run, [(1, 'complete', [])])
-        waits = iter(('{"cursor":2,"status":', '"blocked","id":"t2"}\n'
+        waits = iter(('{"cursor":2,"status":', '"complete","id":"t2"}\n'
                       '{"cursor":3,"status":"failed","id":"t3"}\n'))
 
         def append_after_poll(_):
@@ -222,24 +261,14 @@ class ControlTests(unittest.TestCase):
             return True
 
         with patch.object(control, '_pause', side_effect=append_after_poll):
-            first = control.wait_for_event(run, 0, 2, 1)
+            first = control.wait_for_event(run, 1, 2, 1)
+        self.assertEqual(first['event'], 'result')
         self.assertEqual([row['id'] for row in first['items']], ['t2'])
         self.assertEqual(first['cursor'], 2)
         second = control.wait_for_event(run, first['cursor'], 0, 1)
         self.assertEqual([row['id'] for row in second['items']], ['t3'])
 
-    def test_legacy_final_index_and_snapshot(self):
-        run = self.root / 'runs' / '1'
-        run.mkdir(parents=True)
-        (run / 'status.json').write_text(json.dumps(dict(state='complete', run_id='1', utc='then')))
-        (run / 'results.jsonl').write_text('{"id":"a","status":"complete"}\n{"id":"b","status":"partial"}\n')
-        self.assertEqual(control.read_status(run)['heartbeat_utc'], 'then')
-        result = control.wait_for_event(run, 1, 0)
-        self.assertEqual(result['state'], 'complete')
-        self.assertEqual(result['cursor'], 2)
-        self.assertEqual([row['id'] for row in result['items']], ['b'])
-
-    def test_final_offset_keeps_commit_order_and_can_resume_with_cursor(self):
+    def test_final_results_keep_commit_order_across_pages(self):
         run = Path(self.launch()['batch_id'])
         self.append_rows(run, [(1, 'failed', []), (2, 'partial', []), (3, 'blocked', [])])
         rows = (run / 'result-events.jsonl').read_text().splitlines()
@@ -249,7 +278,6 @@ class ControlTests(unittest.TestCase):
         page = control.results_page(run, limit=1)
         self.assertEqual([row['id'] for row in page['items']], ['t1'])
         self.assertEqual(page['cursor'], 1)
-        self.assertEqual(page['next_offset'], 1)
         live = control.results_page(run, after_cursor=page['cursor'], limit=1)
         self.assertEqual([row['id'] for row in live['items']], ['t2'])
 
@@ -258,15 +286,14 @@ class ControlTests(unittest.TestCase):
         (self.root / 'status-hold.json').write_text(json.dumps(new))
         result = control.cancel(old['batch_id'], 3)
         self.assertTrue(result['dispatcher_term_sent'])
-        # This legacy fixture has no launch journal; stopping its dispatcher
-        # cannot certify that all historically launched tools are gone.
-        self.assertFalse(result['stopped'])
+        self.assertTrue(result['stopped'])
         self.assertEqual(result['state'], 'interrupted')
-        self.assertEqual(json.loads(Path(result['cancel_path']).read_text())['outcome'], 'worker_cleanup_unconfirmed')
+        self.assertEqual(json.loads(Path(result['cancel_path']).read_text())['outcome'], 'stopped')
         self.assertTrue(control.read_status(new['batch_id'])['scheduler_live'])
 
-    def spawn_worker(self, code='import time; time.sleep(30)'):
-        worker = subprocess.Popen([sys.executable, '-c', code], start_new_session=True)
+    def spawn_worker(self, owner, code='import time; time.sleep(30)'):
+        worker = subprocess.Popen([sys.executable, '-c', code], start_new_session=True,
+                                  env={**os.environ, ownership.OWNER_ENV: owner['marker']})
         def cleanup():
             # The test owns this session. Its process cannot have recycled before wait().
             try:
@@ -277,6 +304,20 @@ class ControlTests(unittest.TestCase):
         self.addCleanup(cleanup)
         return worker
 
+    def record_attempt(self, run, worker, owner, number=1, *, journal=True):
+        directory = self.root / 'workers' / 'peer'
+        directory.mkdir(parents=True, exist_ok=True)
+        receipt_path = directory / f'receipt-{number:02d}.json'
+        receipt = dict(batch_id=str(run), run_id=run.name, task_id='peer', attempt=number,
+                       status='running', execution='running', pid=worker.pid,
+                       process_start_ticks=control._process(worker.pid).ticks,
+                       boot_id=owner['boot_id'], owner=owner)
+        receipt_path.write_text(json.dumps(receipt))
+        if journal:
+            path = run / 'attempts' / 'peer' / f'{number:02d}.json'
+            path.parent.mkdir(exist_ok=True)
+            path.write_text(json.dumps(dict(**receipt, source='execution', receipt_path=str(receipt_path))))
+
     def kill_dispatcher(self, status):
         fd = control._pin(status, control._boot_id())
         self.assertIsNotNone(fd)
@@ -285,26 +326,24 @@ class ControlTests(unittest.TestCase):
         finally:
             os.close(fd)
 
-    def test_scheduler_loss_uses_worker_start_event_and_escalates_group(self):
+    def test_scheduler_loss_uses_attempt_journal_and_escalates_owned_descendant(self):
         status = self.launch()
         run = Path(status['batch_id'])
         ready = run / 'descendant'
         code = ('import signal,subprocess,sys,time; '
                 f'p=subprocess.Popen([sys.executable,"-c","import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); open({str(ready)!r}, \'w\').close(); time.sleep(30)"]); '
                 'time.sleep(30)')
-        worker = self.spawn_worker(code)
+        owner = ownership.prepare_owner()
+        worker = self.spawn_worker(owner, code)
         self.wait_until(ready.exists)
-        row = dict(event='worker_started', task_id='peer', pid=worker.pid,
-                   process_start_ticks=control._process(worker.pid).ticks, boot_id=control._boot_id())
-        (run / 'events.jsonl').write_text(json.dumps(row) + '\n')
+        self.record_attempt(run, worker, owner)
         self.kill_dispatcher(status)
         lost = control.wait_for_event(run, 0, 3)
         self.assertEqual(lost['state'], 'orphaned')
         self.assertFalse(lost['waiting_timed_out'])
         result = control.cancel(run, 3)
-        self.assertFalse(result['stopped'], result)
-        self.assertEqual(result['outcome'], 'worker_cleanup_unconfirmed')
-        signals = result['attempts']['peer/00']['signals']
+        self.assertTrue(result['stopped'], result)
+        signals = result['attempts']['peer/01']['signals']
         self.assertTrue(any(row['signal'] == 'SIGKILL' and row['outcome'] == 'sent' for row in signals))
         self.assertEqual(worker.wait(timeout=2), -signal.SIGTERM)
         self.assertFalse(control._process(worker.pid))
@@ -312,14 +351,10 @@ class ControlTests(unittest.TestCase):
     def test_scheduler_loss_recovers_only_exact_batch_receipts(self):
         status, new = self.launch(), self.launch()
         run = Path(status['batch_id'])
-        owned, unrelated = self.spawn_worker(), self.spawn_worker()
-        for task, batch, worker in (('peer', status, owned), ('other', new, unrelated)):
-            directory = self.root / 'workers' / task
-            directory.mkdir(parents=True)
-            receipt = dict(batch_id=batch['batch_id'], task_id=task, status='running', attempt=1,
-                           pid=worker.pid, process_start_ticks=control._process(worker.pid).ticks,
-                           boot_id=control._boot_id())
-            (directory / 'receipt.json').write_text(json.dumps(receipt))
+        owner, other_owner = ownership.prepare_owner(), ownership.prepare_owner()
+        owned, unrelated = self.spawn_worker(owner), self.spawn_worker(other_owner)
+        self.record_attempt(run, owned, owner, journal=False)
+        self.record_attempt(Path(new['batch_id']), unrelated, other_owner, number=2)
         self.kill_dispatcher(status)
         self.assertEqual(control.wait_for_event(run, 0, 3)['state'], 'orphaned')
         cancelled = control.cancel(run, 2)
@@ -328,25 +363,6 @@ class ControlTests(unittest.TestCase):
         self.assertEqual(owned.wait(timeout=2), -signal.SIGTERM)
         self.assertIsNone(unrelated.poll())
         self.assertTrue(control.read_status(new['batch_id'])['scheduler_live'])
-
-    def test_cancel_leaves_unverified_worker_alone(self):
-        status = self.launch()
-        run = Path(status['batch_id'])
-        worker = self.spawn_worker()
-        wrong_ticks = str(int(control._process(worker.pid).ticks) + 1)
-        snapshot = json.loads((run / 'status.json').read_text())
-        snapshot['running_workers'] = dict(peer=dict(pid=worker.pid, process_start_ticks=wrong_ticks))
-        (run / 'status.json').write_text(json.dumps(snapshot))
-        self.kill_dispatcher(status)
-        self.wait_until(lambda: not control.read_status(run)['scheduler_live'])
-        result = control.cancel(run, 1)
-        self.assertFalse(result['stopped'])
-        attempt = result['attempts']['peer/00']
-        self.assertFalse(attempt['stopped'])
-        self.assertTrue(attempt['uncertain'])
-        self.assertEqual(attempt['signals'], [])
-        self.assertIsNone(worker.poll())
-
 
 if __name__ == '__main__':
     unittest.main()

@@ -55,28 +55,20 @@ class RecoveryTests(fixtures.DispatchFixture):
             time.sleep(.01)
         self.fail('timed out waiting for the fake worker')
 
-    def test_missing_and_stale_alias_cannot_repeat_a_completed_attempt(self):
+    def test_completed_attempt_is_not_repeated_by_retry_request(self):
         self.behavior(self.root, {'a': ['partial', 'complete']})
         self.cli()
-        old = self.numbered(1).read_bytes()
         self.cli('--retry-failed')
-        alias = self.directory / 'receipt.json'
-        for stale in (False, True):
-            with self.subTest(stale=stale):
-                if stale:
-                    alias.write_bytes(old)
-                else:
-                    alias.unlink()
-                self.cli('--retry-failed')
-                row = self.row()
-                self.assertEqual((row['status'], row['attempt'], row['reused']), ('complete', 2, True))
-                self.assertEqual(Path(row['receipt_path']), self.numbered(2))
-                self.assertEqual(self.effects(), ['1', '2'])
+        self.cli('--retry-failed')
+        row = self.row()
+        self.assertEqual((row['status'], row['attempt'], row['reused']), ('complete', 2, True))
+        self.assertEqual(Path(row['receipt_path']), self.numbered(2))
+        self.assertEqual(self.effects(), ['1', '2'])
 
     def test_missing_result_does_not_erase_success_or_allow_explicit_retry(self):
         self.cli()
-        alias = self.directory / 'receipt.json'
-        before = alias.read_bytes()
+        receipt = self.numbered(1)
+        before = receipt.read_bytes()
         result = self.directory / 'result-01.json'
         saved = result.read_bytes()
         result.unlink()
@@ -86,7 +78,7 @@ class RecoveryTests(fixtures.DispatchFixture):
             self.assertEqual((row['status'], row['attempt']), ('complete', 1))
             self.assertTrue(any('result unavailable' in issue for issue in row['issues']))
             self.assertFalse(json.loads(self.cli('--report').stdout)['ok'])
-            self.assertEqual(alias.read_bytes(), before)
+            self.assertEqual(receipt.read_bytes(), before)
             self.assertFalse(self.numbered(2).exists())
         result.write_bytes(saved)
         self.cli()
@@ -155,7 +147,6 @@ asyncio.run(dispatch.main())
         self.assertEqual(second['automatic_retry_count'], 1)
         self.assertEqual(self.receipt()['automatic_retry_count'], 2)
         self.assertEqual(self.effects(), ['1', '2', '3'])
-        self.assertEqual(json.loads(self.cli('--report').stdout)['automatic_retries'], 2)
         self.assertEqual(json.loads(self.cli('--report').stdout)['automatic_retries_started'], 2)
         self.cli()
         self.assertEqual(self.effects(), ['1', '2', '3'])
@@ -199,19 +190,11 @@ asyncio.run(dispatch.main())
         self.assertEqual(self.effects(), ['1', '2'])
         self.assertNotEqual(self.control()['chain_id'], state_a['chain_id'])
 
-    def test_compatibility_receipt_failure_does_not_diverge_retry_schedule(self):
+    def test_automatic_retry_writes_only_numbered_attempts(self):
         self.behavior(self.root, {'a': ['transient', 'complete']})
-        run = self.run_wrapped('''import asyncio
-import dispatch
-write = dispatch.write_json
-def injected(path, value):
-    if path.name == 'receipt.json':
-        raise PermissionError('injected compatibility write failure')
-    write(path, value)
-dispatch.write_json = injected
-asyncio.run(dispatch.main())
-''', '--retry-backoff-seconds', '0')
-        self.assertEqual(run.returncode, 0, run.stderr)
+        self.cli('--retry-backoff-seconds', '0')
+        self.assertFalse((self.directory / 'receipt.json').exists())
+        self.assertFalse((self.directory / 'result.json').exists())
         self.assertEqual((json.loads(self.numbered(2).read_text())['execution'], self.control()['phase']),
                          ('succeeded', 'settled'))
         self.assertEqual(self.effects(), ['1', '2'])

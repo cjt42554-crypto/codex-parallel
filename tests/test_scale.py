@@ -69,11 +69,11 @@ class ScaleTests(fixtures.DispatchFixture):
         self.assertEqual(first['status'], 'failed')
         self.assertEqual(self.receipt()['model_requested'], first['model_requested'])
         self.assertEqual(self.receipt()['reasoning_effort_requested'], first['reasoning_effort_requested'])
-        self.assertEqual(self.report()['automatic_retries'], 3)
+        self.assertEqual(self.report()['automatic_retries_started'], 3)
         # A subsequent ordinary invocation reuses failed results too; it must not silently retry them.
         self.assertEqual(self.run_cli('--retry-backoff-seconds', '0').returncode, 0)
         self.assertEqual(self.receipt('exhausted')['attempt'], 3)
-        self.assertEqual(self.report()['automatic_retries'], 0)
+        self.assertEqual(self.report()['automatic_retries_started'], 0)
 
     def test_retry_safe_opt_in_and_disable(self):
         self.jobs(self.root, ['a', 'safe'])
@@ -91,7 +91,7 @@ class ScaleTests(fixtures.DispatchFixture):
                                                        tasks=[dict(id='a', prompt='work')])) )
         self.behavior(other, {'a': ['transient_tool', 'complete']})
         self.assertEqual(self.run_cli('--retry-backoff-seconds', '0', root=other).returncode, 0)
-        self.assertEqual(json.loads((other / 'workers/a/receipt.json').read_text())['attempt'], 2)
+        self.assertEqual(json.loads((other / 'workers/a/receipt-02.json').read_text())['attempt'], 2)
 
     def test_backoff_does_not_hold_worker_slot(self):
         self.jobs(self.root, ['a', 'b'])
@@ -99,7 +99,7 @@ class ScaleTests(fixtures.DispatchFixture):
         result = self.run_cli('--concurrency', '1', '--retry-backoff-seconds', '.6')
         self.assertEqual(result.returncode, 0, result.stderr)
         report = self.report()
-        events = [json.loads(line) for line in (Path(report['summary_path']).parent / 'events.jsonl').read_text().splitlines()]
+        events = [json.loads(line) for line in (Path(report['report_path']).parent / 'events.jsonl').read_text().splitlines()]
         starts = [event['task_id'] for event in events if event['event'] == 'worker_started']
         self.assertEqual(starts, ['a', 'b', 'a'])
         self.assertEqual(report['peak_workers'], 1)
@@ -133,7 +133,7 @@ class ScaleTests(fixtures.DispatchFixture):
     def test_compact_report_attention_and_result_pagination(self):
         ids = [f'task-{i:03}' for i in range(30)]
         self.jobs(self.root, ids)
-        self.behavior(self.root, {ids[1]: 'blocked', ids[2]: 'issues'})
+        self.behavior(self.root, {ids[1]: 'blocked', ids[2]: 'partial'})
         result = self.run_cli('--concurrency', '8', '--ramp-seconds', '0')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(len(result.stdout.splitlines()), 2)
@@ -148,13 +148,11 @@ class ScaleTests(fixtures.DispatchFixture):
         page = json.loads(self.run_cli('--results', '--attention', '--limit', '1').stdout)
         self.assertEqual(page['total'], 2)
         self.assertEqual(page['items'][0]['id'], event_order[0])
-        self.assertEqual(page['next_offset'], 1)
-        page = json.loads(self.run_cli('--results', '--attention', '--limit', '1', '--offset', '1').stdout)
+        page = json.loads(self.run_cli('--results', '--attention', '--limit', '1', '--after', str(page['cursor'])).stdout)
         self.assertEqual(page['items'][0]['id'], event_order[1])
-        self.assertIsNone(page['next_offset'])
         all_rows = [json.loads(line) for line in Path(report['results_path']).read_text().splitlines()]
         self.assertEqual(len(all_rows), 30)
-        self.assertEqual(all_rows[-1]['summary'], 'body')
+        self.assertEqual(all_rows[-1]['answer'], 'body')
 
     def test_hundreds_of_workers_respect_bound_and_throttle_sampling(self):
         self.jobs(self.root, [f'task-{i:03}' for i in range(128)])
@@ -168,7 +166,7 @@ class ScaleTests(fixtures.DispatchFixture):
         self.assertLessEqual(report['peak_workers'], 16)
         self.assertGreater(report['peak_workers'], 1)
         self.assertEqual(len(result.stdout.splitlines()), 2)
-        samples = (Path(report['summary_path']).parent / 'resources.jsonl').read_text().splitlines()
+        samples = (Path(report['report_path']).parent / 'resources.jsonl').read_text().splitlines()
         self.assertLessEqual(len(samples), int(elapsed / 2) + 3)
         print(json.dumps(dict(benchmark='128_fake_exec', elapsed_seconds=round(elapsed, 3),
                               peak_workers=report['peak_workers'], status_samples=len(samples))))
@@ -186,9 +184,10 @@ class ScaleTests(fixtures.DispatchFixture):
         for job in jobs:
             directory = self.root / 'workers' / job['id']
             directory.mkdir(parents=True)
-            (directory / 'receipt.json').write_text(json.dumps(dict(status='complete', attempt=1,
+            (directory / 'receipt-01.json').write_text(json.dumps(dict(task_id=job['id'], status='complete', attempt=1,
+                execution='succeeded', reported_status='complete',
                 input_fingerprint=job['_fingerprint'], result_file='result-01.json')))
-            (directory / 'result-01.json').write_text(json.dumps(dict(status='complete', summary='cached', artifacts=[], issues=[])))
+            (directory / 'result-01.json').write_text(json.dumps(dict(status='complete', answer='cached')))
         start = time.monotonic()
         result = self.run_cli()
         elapsed = time.monotonic() - start
@@ -203,42 +202,23 @@ class ScaleTests(fixtures.DispatchFixture):
         print(json.dumps(dict(benchmark='1000_cached_64KiB_common', elapsed_seconds=round(elapsed, 3),
                               prepare_peak_bytes=peak, output_bytes=len(result.stdout) + len(result.stderr))))
 
-    def test_result_evidence_stays_bound_to_native_and_legacy_attempts(self):
-        for legacy in (False, True):
-            with self.subTest(legacy=legacy):
-                root = self.make_root('legacy') if legacy else self.root
-                self.behavior(root, {'a': 'partial'})
-                self.assertEqual(self.run_cli(root=root).returncode, 0)
-                directory = root / 'workers/a'
-                if legacy:
-                    receipt = json.loads((directory / 'receipt.json').read_text())
-                    for field in ('result_file', 'owner', 'execution', 'reported_status', 'result_observation'):
-                        receipt.pop(field, None)
-                    (directory / 'receipt.json').write_text(json.dumps(receipt))
-                    (directory / 'receipt-01.json').unlink()
-                    (directory / 'control.json').unlink()
-                    self.assertEqual(self.run_cli(root=root).returncode, 0)
-                row = json.loads(self.run_cli('--results', root=root).stdout)['items'][0]
-                self.behavior(root, {})
-                self.assertEqual(self.run_cli('--only', 'a', '--retry-failed', root=root).returncode, 0)
-                if legacy:
-                    # Missing old ownership evidence cannot authorize replay.
-                    self.assertFalse((directory / 'receipt-02.json').exists())
-                    # A later compatibility-pointer update cannot change the
-                    # historical row's frozen receipt and result evidence.
-                    (directory / 'receipt.json').write_text(json.dumps(dict(status='complete', attempt=2)))
-                    (directory / 'result.json').write_text(json.dumps(dict(status='complete', summary='new')))
-                saved = json.loads(Path(row['receipt_path']).read_text())
-                self.assertEqual((saved['status'], saved['attempt']), ('partial', 1))
-                self.assertEqual(json.loads(Path(row['result_path']).read_text())['status'], 'partial')
-                self.assertEqual(json.loads((directory / 'receipt.json').read_text())['attempt'], 2)
+    def test_result_evidence_stays_bound_to_its_attempt(self):
+        self.behavior(self.root, {'a': 'partial'})
+        self.assertEqual(self.run_cli().returncode, 0)
+        directory = self.root / 'workers/a'
+        row = json.loads(self.run_cli('--results').stdout)['items'][0]
+        self.behavior(self.root, {})
+        self.assertEqual(self.run_cli('--only', 'a', '--retry-failed').returncode, 0)
+        saved = json.loads(Path(row['receipt_path']).read_text())
+        self.assertEqual((saved['status'], saved['attempt']), ('partial', 1))
+        self.assertEqual(json.loads(Path(row['result_path']).read_text())['status'], 'partial')
+        self.assertEqual(json.loads((directory / 'receipt-02.json').read_text())['attempt'], 2)
 
     def test_damaged_saved_result_reference_is_reported_without_losing_peers(self):
         self.behavior(self.root, {'a': 'partial'})
         self.assertEqual(self.run_cli().returncode, 0)
         receipt = self.receipt()
         receipt['result_file'] = None
-        (self.root / 'workers/a/receipt.json').write_text(json.dumps(receipt))
         (self.root / 'workers/a/receipt-01.json').write_text(json.dumps(receipt))
         self.jobs(self.root, ['a', 'b'])
         result = self.run_cli()
@@ -270,6 +250,8 @@ class ScaleTests(fixtures.DispatchFixture):
             with (self.root / '.dispatch.lock').open('a') as lock:
                 fcntl.flock(lock, fcntl.LOCK_EX)
                 batch = mod.Batch(self.root, args, jobs, lock.fileno())
+                import batch_control
+                batch_control.register_submission(batch.run_dir)
                 original = batch.worker
 
                 async def worker(job, force=False):

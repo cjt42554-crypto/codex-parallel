@@ -4,32 +4,20 @@
   "properties": {
     "status": {
       "type": "string",
+      "description": "Completion of the agreed deliverables. Use partial or blocked if required deliverables are unfinished. A completed task can have research limitations.",
       "enum": [
         "complete",
         "partial",
         "blocked"
       ]
     },
-    "summary": {
-      "type": "string"
-    },
-    "artifacts": {
-      "type": "array",
-      "items": {
-        "type": "string"
-      }
-    },
-    "issues": {
-      "type": "array",
-      "items": {
-        "type": "string"
-      }
+    "answer": {
+      "type": "string",
+      "description": "The full answer in natural language, including findings, artifact paths or links, evidence limits, and any reason a follow-up action is needed."
     }
   },
   "required": [
     "status",
-    "summary",
-    "artifacts",
-    "issues"
+    "answer"
   ]
 }

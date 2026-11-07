@@ -9,11 +9,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 import batch_control as control
 
 
-def result(task, cursor=None, status='complete', issues=None):
-    row = dict(id=task, status=status, issues=issues or [])
-    if cursor is not None:
-        row['cursor'] = cursor
-    return row
+def result(task, cursor, status='complete', issues=None):
+    return dict(id=task, cursor=cursor, status=status, issues=issues or [])
 
 
 class ResultPagingTests(unittest.TestCase):
@@ -31,7 +28,7 @@ class ResultPagingTests(unittest.TestCase):
             for row in rows:
                 stream.write(json.dumps(row) + '\n')
 
-    def test_offsets_continue_in_commit_order_after_terminal_status(self):
+    def test_cursor_continues_in_commit_order_after_terminal_status(self):
         for run_id, terminal in enumerate(('complete', 'interrupted'), start=1):
             with self.subTest(terminal=terminal):
                 run = self.runs / str(run_id)
@@ -41,21 +38,18 @@ class ResultPagingTests(unittest.TestCase):
                 self.append(events, b, c)
                 first = control.results_page(run, limit=1)
                 self.assertEqual(first['state'], 'running')
-                self.assertEqual(first['next_offset'], 1)
 
                 self.append(events, a)
                 self.append(run / 'results.jsonl', a, b, c)
                 self.set_state(run, terminal)
-                second = control.results_page(run, offset=first['next_offset'], limit=1)
+                second = control.results_page(run, after_cursor=first['cursor'], limit=1)
                 self.assertEqual(second['state'], terminal)
-                self.assertEqual(second['next_offset'], 2)
-                third = control.results_page(run, offset=second['next_offset'], limit=1)
-                self.assertIsNone(third['next_offset'])
+                third = control.results_page(run, after_cursor=second['cursor'], limit=1)
                 self.assertEqual([page['items'][0]['id'] for page in (first, second, third)],
                                  ['b', 'c', 'a'])
                 self.assertEqual([page['cursor'] for page in (first, second, third)], [1, 2, 3])
 
-    def test_attention_offsets_and_cursors_follow_the_same_sequence(self):
+    def test_attention_pages_skip_successes_without_losing_results(self):
         run = self.runs / '1'
         self.set_state(run, 'running')
         a = result('a', 4, 'not_started')
@@ -65,31 +59,14 @@ class ResultPagingTests(unittest.TestCase):
         events = run / 'result-events.jsonl'
         self.append(events, b, d, c)
         first = control.results_page(run, attention=True, limit=1)
-        self.assertEqual((first['items'], first['cursor'], first['next_offset']), ([b], 1, 1))
+        self.assertEqual((first['items'], first['cursor']), ([b], 1))
 
         self.append(events, a)
         self.append(run / 'results.jsonl', a, b, c, d)
         self.set_state(run, 'interrupted')
-        offset_page = control.results_page(run, attention=True, offset=first['next_offset'])
-        cursor_page = control.results_page(run, attention=True, after_cursor=first['cursor'])
-        for page in (offset_page, cursor_page):
-            self.assertEqual((page['items'], page['cursor'], page['high_watermark'], page['total']),
-                             ([c, a], 4, 4, 3))
-            self.assertIsNone(page['next_offset'])
-
-    def test_legacy_archive_keeps_saved_order_and_synthetic_cursors(self):
-        run = self.runs / '1'
-        self.set_state(run, 'complete')
-        path = run / 'results.jsonl'
-        self.append(path, result('c'), result('a', status='partial'), result('b'))
-
-        first = control.results_page(run, limit=1)
-        self.assertEqual((first['items'], first['results_path']), ([result('c', 1)], str(path)))
-        rest = control.results_page(run, offset=first['next_offset'])
-        self.assertEqual(rest['items'], [result('a', 2, 'partial'), result('b', 3)])
-        selected = control.results_page(run, after_cursor=first['cursor'], attention=True)
-        self.assertEqual((selected['items'], selected['cursor']), ([result('a', 2, 'partial')], 3))
-
+        page = control.results_page(run, attention=True, after_cursor=first['cursor'])
+        self.assertEqual((page['items'], page['cursor'], page['high_watermark'], page['total']),
+                         ([c, a], 4, 4, 3))
 
 if __name__ == '__main__':
     unittest.main()

@@ -42,7 +42,7 @@ class DashboardInvocationTests(DispatchFixture):
     def test_each_manifest_retains_its_own_receipt_prompt_and_answer(self):
         # Make the fake worker outputs distinguishable across attempts.
         worker = self.scripts / 'codexexec'
-        worker.write_text(worker.read_text().replace("'summary':'body'", "'summary':f'{mode} {attempt}'"))
+        worker.write_text(worker.read_text().replace("'answer':'body'", "'answer':f'{mode} {attempt}'"))
         (self.root / 'other.json').write_bytes((self.root / 'tasks.json').read_bytes())
         self.behavior(self.root, {'a': 'blocked'})
         self.run_batch()
@@ -57,7 +57,6 @@ class DashboardInvocationTests(DispatchFixture):
         for kind, suffix in (('receipt', 'json'), ('prompt', 'txt'), ('result', 'json')):
             self.assertEqual([p.name for p in reads if p.name.startswith(f'{kind}-')],
                              [f'{kind}-01.{suffix}', f'{kind}-02.{suffix}'])
-        self.assertFalse(any(p.name in ('receipt.json', 'result.json') for p in reads))
 
     def test_cancelled_retry_does_not_display_an_old_attempt_for_unstarted_work(self):
         self.jobs(self.root, ['c', 'b'])
@@ -101,7 +100,7 @@ class DashboardInvocationTests(DispatchFixture):
         directory = self.root / 'workers' / ids[0]
         write_json(directory / 'receipt-01.json', status='complete', attempt=1, result_file='result-01.json')
         (directory / 'prompt-01.txt').write_text('sent')
-        write_json(directory / 'result-01.json', status='complete', summary='answer')
+        write_json(directory / 'result-01.json', status='complete', answer='answer')
         view = dashboard.BatchView(self.root, 'tasks.json')
 
         with (patch.object(Path, 'is_symlink', autospec=True, side_effect=Path.is_symlink) as symlink,
@@ -126,18 +125,6 @@ class DashboardInvocationTests(DispatchFixture):
             view.detail(rows[0])
         self.assertEqual(opened, [])
 
-    def test_legacy_summary_is_scoped_to_the_saved_attempt(self):
-        run = self.root / 'runs' / '1'
-        write_json(run / 'config.json', jobs=['a'])
-        write_json(run / 'summary.json', results={'a': dict(status='blocked', attempt=1, exit_code=0,
-                                                           turn_completed_utc='then')})
-        directory = self.root / 'workers/a'
-        write_json(directory / 'receipt.json', status='complete', attempt=2)
-        write_json(directory / 'result.json', status='complete', summary='latest')
-        write_json(directory / 'result-01.json', status='blocked', summary='historical')
-        row, = dashboard.snapshot(self.root, 'tasks.json')['tasks']
-        self.assertEqual((row['status'], row['attempt'], row['answer']), ('blocked', 1, 'historical'))
-
     def test_unstarted_history_uses_its_frozen_config_and_common(self):
         run = self.saved_run(['a'], 'interrupted')
         common = run / 'common.md'
@@ -157,19 +144,13 @@ class DashboardInvocationTests(DispatchFixture):
         self.assertFalse(row['prompt_sent'])
         self.assertFalse(any(path.name in ('tasks.json', 'COMMON.md') for path in reads))
 
-        # Older configurations cannot safely reconstruct a preview from current inputs.
-        write_json(run / 'config.json', jobs=['a'])
-        row, = dashboard.snapshot(self.root, 'tasks.json')['tasks']
-        self.assertEqual((row['model'], row['effort']), (None, None))
-        self.assertIn('本次运行未保存任务提示词', row['prompt'])
-        self.assertNotIn('modified', row['prompt'])
-
     def test_binding_precedes_stale_snapshot_and_preserves_an_unindexed_success(self):
         run = self.saved_run(['a', 'b'], 'running', queued_ids=['a', 'b'], running_workers={})
         write_json(run / 'config.json', jobs=['a', 'b'], job_metadata={'a': {}, 'b': {}}, attempt_journal_version=1)
         directory = self.root / 'workers/a'
         path = run / 'bindings/a.json'
-        write_json(path, task_id='a', attempt=1, source='execution', execution='prepared',
+        write_json(path, task_id='a', attempt=1, run_id=run.name, batch_id=str(run),
+                   source='execution', execution='prepared',
                    receipt_path=str(directory / 'receipt-01.json'))
         directory.mkdir(parents=True)
         (directory / 'prompt-01.txt').write_text('prepared input')
@@ -186,11 +167,13 @@ class DashboardInvocationTests(DispatchFixture):
         self.assertEqual((detail['prompt'], detail['prompt_sent']), ('prepared input', False))
 
         # A newer binding plus numbered receipt can outlive the scheduler and its result index.
-        write_json(path, task_id='a', attempt=2, source='execution', execution='prepared',
+        write_json(path, task_id='a', attempt=2, run_id=run.name, batch_id=str(run),
+                   source='execution', execution='prepared',
                    receipt_path=str(directory / 'receipt-02.json'))
-        write_json(directory / 'receipt-02.json', attempt=2, status='complete', execution='succeeded',
+        write_json(directory / 'receipt-02.json', attempt=2, run_id=run.name, batch_id=str(run),
+                   status='complete', execution='succeeded',
                    reported_status='complete', result_observation='valid', result_file='result-02.json')
-        write_json(directory / 'result-02.json', status='complete', summary='already completed')
+        write_json(directory / 'result-02.json', status='complete', answer='already completed')
         with patch.object(dashboard, 'live', return_value=False):
             _, rows = view.rows()
         row = rows[0]

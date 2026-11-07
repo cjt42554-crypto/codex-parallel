@@ -133,7 +133,7 @@ def _key(row):
 
 def _ledger_key(receipt, owner):
     return dict(attempt=receipt.get('attempt'), run_id=receipt.get('run_id'),
-                batch_id=receipt.get('batch_id'), marker=owner.get('marker'))
+                batch_id=receipt.get('batch_id'), marker=owner['marker'])
 
 
 def _read_ledger(path, key, scope):
@@ -143,7 +143,7 @@ def _read_ledger(path, key, scope):
         return {}, {}
     if (not isinstance(document, dict) or document.get('key') != key
             or not isinstance(document.get('processes'), list)
-            or not isinstance(document.get('concerns', []), list)):
+            or not isinstance(document.get('concerns'), list)):
         raise ValueError('ownership ledger does not match attempt')
     def identities(rows):
         result = {}
@@ -155,7 +155,7 @@ def _read_ledger(path, key, scope):
                 raise ValueError('invalid process identity in ownership ledger')
             result[_key(row)] = row
         return result
-    return identities(document['processes']), identities(document.get('concerns', []))
+    return identities(document['processes']), identities(document['concerns'])
 
 
 def _write_ledger(path, key, claims, concerns):
@@ -190,12 +190,6 @@ def _ledger_lock(path, deadline):
         raise
 
 
-def _legacy_may_have_launched(receipt):
-    return (receipt.get('status') in ('running', 'prepared')
-            or any(receipt.get(key) is not None for key in
-                   ('pid', 'process_start_ticks', 'execution_started_utc', 'thread_id', 'exit_code', 'command')))
-
-
 def _missing_known_pid(pid, uncertain):
     """A missing procfs entry is not necessarily a missing local PID."""
     if not hasattr(os, 'pidfd_open'):
@@ -217,22 +211,16 @@ def _collect(receipt, owner, scope, retained, prior_concerns, uncertain):
     root_pid = _number(receipt.get('pid'), 2)
     root_ticks = _number(receipt.get('process_start_ticks'))
     known = set(retained) | set(prior_concerns)
-    if root_pid is not None and root_ticks is not None and (owner or receipt.get('boot_id')):
+    if root_pid is not None and root_ticks is not None:
         known.add((root_pid, root_ticks))
     tracked_pids = {pid for pid, _ in known}
     if root_pid is not None:
         tracked_pids.add(root_pid)
-    marker = os.fsencode(owner['marker']) if owner else None
+    marker = os.fsencode(owner['marker'])
     thread_id = receipt.get('thread_id')
     thread = os.fsencode(thread_id) if isinstance(thread_id, str) and thread_id else None
-    earliest = owner['not_before_ticks'] if owner else None
-    if not owner:
-        # A legacy thread can only be compared with a launch on a known boot.
-        thread = thread if receipt.get('boot_id') and root_ticks is not None else None
-        earliest = root_ticks if receipt.get('boot_id') else None
+    earliest = owner['not_before_ticks']
 
-    if not marker and not thread and not tracked_pids:
-        return [], {}
     table, checks, parent_edges = {}, {}, {}
     opaque, opaque_candidates = set(), {}
     try:
@@ -256,7 +244,7 @@ def _collect(receipt, owner, scope, retained, prior_concerns, uncertain):
             continue
         if not process.live:
             continue
-        if earliest is not None and process.ticks < earliest and pid not in tracked_pids:
+        if process.ticks < earliest and pid not in tracked_pids:
             continue
         table[pid] = process
         parent_edges[pid] = {process.parent}
@@ -311,32 +299,32 @@ def _collect(receipt, owner, scope, retained, prior_concerns, uncertain):
         retained_match = key in retained
         prior_concern = key in prior_concerns
         recorded_pid = pid == root_pid and process.ticks == root_ticks
-        exact = retained_match or (recorded_pid and not owner and bool(receipt.get('boot_id')))
-        in_window = earliest is None or process.ticks >= earliest
-        owner_match = bool(marker and markers and marker in markers and in_window)
+        in_window = process.ticks >= earliest
+        owner_match = bool(markers and marker in markers and in_window)
         thread_match = bool(thread and threads and thread in threads and in_window)
-        incomplete_root = pid == root_pid and (root_ticks is None or (not owner and not receipt.get('boot_id')))
-        related = exact or inherited or owner_match or thread_match or recorded_pid or incomplete_root or prior_concern
+        incomplete_root = pid == root_pid and root_ticks is None
+        related = (retained_match or inherited or owner_match or thread_match or recorded_pid
+                   or incomplete_root or prior_concern)
         if not related:
             if error:
                 opaque.add(pid)
-                if owner and uid == scope['uid'] and in_window:
+                if uid == scope['uid'] and in_window:
                     opaque_candidates[pid] = error
             return False
         if pid == os.getpid():
             reason = 'attempt_identity_matches_observer'
         elif uid != scope['uid']:
             reason = 'process_uid_unverified' if uid is None else 'process_uid_changed'
-        elif ((markers and (not marker or markers != {marker}))
+        elif ((markers and markers != {marker})
               or (thread and threads and threads != {thread})):
             reason = 'conflicting_process_ownership'
         elif pid == root_pid and root_ticks is not None and not recorded_pid and not retained_match:
             reason = 'conflicting_process_start_ticks'
         elif prior_concern and not (owner_match or thread_match):
             reason = 'retained_ownership_uncertainty'
-        elif not (exact or owner_match or thread_match) and error:
+        elif not (retained_match or owner_match or thread_match) and error:
             reason = 'process_ownership_unreadable'
-        elif not (exact or owner_match or thread_match or inherited):
+        elif not (retained_match or owner_match or thread_match or inherited):
             reason = 'worker_identity_unverified'
         else:
             evidence = [kind for kind, found in (('receipt_pid', recorded_pid), ('ledger', retained_match),
@@ -379,29 +367,22 @@ def _scan(receipt, directory, persist, carry=(), carry_concerns=(), lock_deadlin
                     scope=dict(kind='local_linux_procfs'))
 
     owner = receipt.get('owner')
-    invalid = False
-    if owner is not None:
-        if (not isinstance(owner, dict) or not isinstance(owner.get('marker'), str) or not owner['marker']
-                or type(owner.get('uid')) is not int or not owner.get('boot_id') or not owner.get('pid_namespace')
-                or type(owner.get('not_before_ticks')) is not int or owner['not_before_ticks'] < 0):
-            uncertain.append(dict(reason='invalid_attempt_owner'))
-            invalid = True
-        elif receipt.get('boot_id') and receipt['boot_id'] != owner['boot_id']:
-            uncertain.append(dict(reason='conflicting_attempt_boot_identity'))
-            invalid = True
-    if invalid:
-        return dict(processes=[], uncertain=uncertain, scope=scope)
-
-    owner = owner or {}
-    boot = owner.get('boot_id') or receipt.get('boot_id')
-    if boot and boot != scope['boot_id']:
-        return dict(processes=[], uncertain=[], scope=scope)
-    if owner and any(owner[key] != scope[key] for key in ('uid', 'pid_namespace')):
-        return dict(processes=[], uncertain=[dict(reason='attempt_outside_observer_scope')], scope=scope)
-    if not owner:
-        if not _legacy_may_have_launched(receipt):
+    if owner is None:
+        # The dispatcher assigns an owner before publishing a numbered attempt.
+        if (receipt.get('attempt') is None and receipt.get('pid') is None
+                and receipt.get('execution') in ('prepared', 'failed', 'interrupted')):
             return dict(processes=[], uncertain=[], scope=scope)
-        uncertain.append(dict(reason='legacy_attempt_has_no_launch_owner'))
+        return dict(processes=[], uncertain=[dict(reason='missing_attempt_owner')], scope=scope)
+    if (not isinstance(owner, dict) or not isinstance(owner.get('marker'), str) or not owner['marker']
+            or type(owner.get('uid')) is not int or not owner.get('boot_id') or not owner.get('pid_namespace')
+            or type(owner.get('not_before_ticks')) is not int or owner['not_before_ticks'] < 0):
+        return dict(processes=[], uncertain=[dict(reason='invalid_attempt_owner')], scope=scope)
+    if receipt.get('boot_id') and receipt['boot_id'] != owner['boot_id']:
+        return dict(processes=[], uncertain=[dict(reason='conflicting_attempt_boot_identity')], scope=scope)
+    if owner['boot_id'] != scope['boot_id']:
+        return dict(processes=[], uncertain=[], scope=scope)
+    if any(owner[key] != scope[key] for key in ('uid', 'pid_namespace')):
+        return dict(processes=[], uncertain=[dict(reason='attempt_outside_observer_scope')], scope=scope)
 
     attempt = _number(receipt.get('attempt'), 1)
     path = Path(directory) / f'ownership-{attempt:02d}.json' if directory is not None and attempt else None
@@ -474,9 +455,9 @@ def _send(row, sig, receipt=None):
                 # is unreadable. A positive conflicting marker never does.
                 pass
             else:
-                marker = (receipt.get('owner') or {}).get('marker')
+                marker = os.fsencode(receipt['owner']['marker'])
                 thread = receipt.get('thread_id')
-                if ((markers and (not marker or markers != {os.fsencode(marker)}))
+                if ((markers and markers != {marker})
                         or (thread and threads and threads != {os.fsencode(thread)})):
                     raise ValueError('conflicting ownership at signal time')
         signal.pidfd_send_signal(fd, sig)
@@ -539,10 +520,10 @@ def terminate_owned(receipt, directory=None, deadline=None):
                     result.update(outcome='failed', error=str(exc))
                     failures[key] = dict(reason='process_signal_failed', pid=row['pid'], error=str(exc))
                 signals.append(result)
-        # Static evidence gaps (e.g. legacy no-owner or a different scope) will
+        # Static evidence gaps (e.g. missing owner or a different scope) will
         # not be resolved by polling once we have stopped any verified claims.
         if not processes and uncertain and all(row['reason'] in {
-                'legacy_attempt_has_no_launch_owner', 'invalid_attempt_owner',
+                'missing_attempt_owner', 'invalid_attempt_owner',
                 'attempt_outside_observer_scope', 'conflicting_attempt_boot_identity',
         } for row in uncertain):
             return dict(stopped=False, remaining=[], uncertain=uncertain, scope=scan['scope'], signals=signals)

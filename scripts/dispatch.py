@@ -26,9 +26,12 @@ from typing import NamedTuple
 
 import process_ownership
 import task_control
+from result_contract import RESULT_STATES, needs_attention, result_issues, valid_result
 
 SCRIPTS = Path(__file__).resolve().parent
 TERMINATE_GRACE_SECONDS = 10
+DEFAULT_MAX_SUBAGENTS = 3
+MULTI_AGENT_FIELDS = ('multi_agent', 'max_subagents', 'subagent_model', 'subagent_effort')
 
 def remember_run(root, manifest):
     """Optional monitor discovery; failures must not affect execution."""
@@ -106,14 +109,23 @@ class ConfigurationError(ValueError):
     pass
 
 
+def read_common(root):
+    """Shared context is optional for task-only workspaces."""
+    try:
+        return (root / 'COMMON.md').read_text()
+    except FileNotFoundError:
+        return ''
+
+
 def load_jobs(root, args):
     manifest = json.loads((root / args.manifest).read_text())
     defaults = {}
     if isinstance(manifest, dict):
         defaults = manifest.get('defaults', {})
-        if not isinstance(defaults, dict) or set(defaults) - {'model', 'effort', 'web_search', 'write_dirs',
-                                                             'retry_safe', 'task_timeout_seconds', 'idle_warning_seconds'}:
-            raise ConfigurationError('unsupported defaults; use model, effort, web_search, write_dirs, retry_safe, task_timeout_seconds, idle_warning_seconds')
+        fields = ('model', 'effort', 'web_search', 'write_dirs', 'retry_safe', 'task_timeout_seconds',
+                  'idle_warning_seconds', *MULTI_AGENT_FIELDS)
+        if not isinstance(defaults, dict) or set(defaults) - set(fields):
+            raise ConfigurationError('unsupported defaults; use ' + ', '.join(fields))
         jobs = manifest.get('tasks')
     else:
         jobs = manifest
@@ -142,6 +154,17 @@ def load_jobs(root, args):
             raise ConfigurationError(f'task {task_id}: invalid web_search mode')
         if not isinstance(job.get('retry_safe', False), bool):
             raise ConfigurationError(f'task {task_id}: retry_safe must be a boolean')
+        multi_agent = job.get('multi_agent', False)
+        if not isinstance(multi_agent, bool):
+            raise ConfigurationError(f'task {task_id}: multi_agent must be a boolean')
+        limit = job.get('max_subagents', DEFAULT_MAX_SUBAGENTS)
+        if type(limit) is not int or not 1 <= limit <= 2**63 - 1:
+            raise ConfigurationError(f'task {task_id}: max_subagents must be a positive integer in TOML range')
+        for field in ('subagent_model', 'subagent_effort'):
+            if multi_agent or field in job:
+                if not isinstance(job.get(field), str) or not job[field].strip():
+                    raise ConfigurationError(f'task {task_id}: {field} must be a nonempty string')
+                job[field] = job[field].strip()
         for field in ('task_timeout_seconds', 'idle_warning_seconds'):
             if field in job and (type(job[field]) not in (int, float) or not math.isfinite(job[field]) or job[field] < 0):
                 raise ConfigurationError(f'task {task_id}: {field} must be a finite nonnegative number (0 disables)')
@@ -160,31 +183,30 @@ def load_jobs(root, args):
 
 
 def task_spec(job, prompt, channel):
-    return dict(prompt_sha256=hashlib.sha256(prompt.encode()).hexdigest(),
+    spec = dict(prompt_sha256=hashlib.sha256(prompt.encode()).hexdigest(),
                 model=job['model'], effort=job['effort'], channel=channel,
                 web_search=job.get('web_search', 'disabled'),
                 write_dirs=sorted(set(str(Path(p).resolve()) for p in job.get('write_dirs', []))))
+    # Child settings affect task identity only when child agents are enabled.
+    if job.get('multi_agent'):
+        spec.update(multi_agent=True, max_subagents=job.get('max_subagents', DEFAULT_MAX_SUBAGENTS),
+                    subagent_model=job['subagent_model'], subagent_effort=job['subagent_effort'])
+    return spec
+
+
+def multi_agent_args(spec):
+    if not spec.get('multi_agent'):
+        return ['--disable', 'multi_agent']
+    return ['--enable', 'multi_agent', '-c', 'agents.enabled=true',
+            '-c', f'agents.max_concurrent_threads_per_session={spec["max_subagents"]}',
+            '-c', 'agents.default_subagent_model=' + json.dumps(spec['subagent_model']),
+            '-c', 'agents.default_subagent_reasoning_effort=' + json.dumps(spec['subagent_effort'])]
 
 
 def fingerprint(spec):
     return hashlib.sha256(json.dumps(spec, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
 
-def legacy_fingerprint(receipt):
-    """Recover only the execution inputs actually recorded by the old dispatcher."""
-    cmd = receipt.get('command', [])
-    if not isinstance(cmd, list) or not all(isinstance(v, str) for v in cmd):
-        return None
-    try:
-        channel = 'sub' if '--sub' in cmd else 'api' if '--api' in cmd else None
-        web = next(json.loads(v.split('=', 1)[1]) for v in cmd if v.startswith('web_search='))
-        spec = dict(prompt_sha256=receipt['prompt_sha256'], model=receipt['model_requested'],
-                    effort=receipt['reasoning_effort_requested'], channel=channel, web_search=web,
-                    write_dirs=sorted(set(str(Path(cmd[i + 1]).resolve())
-                                          for i, v in enumerate(cmd) if v == '--add-dir')))
-        return fingerprint(spec) if channel else None
-    except (KeyError, IndexError, ValueError, StopIteration):
-        return None
 
 
 def read_receipt(path):
@@ -198,7 +220,6 @@ def read_receipt(path):
 
 
 ATTEMPT_FILE = re.compile(r'(events|prompt|stderr|receipt|result)-(\d+)\.(jsonl|txt|log|json)')
-RESULT_STATES = ('complete', 'partial', 'blocked')
 
 
 class AttemptEvidence(NamedTuple):
@@ -219,7 +240,6 @@ def recover_attempt(directory):
         return AttemptEvidence(None, None, 0, None, [])
     except OSError as exc:
         return AttemptEvidence(None, None, 0, f'cannot inspect previous attempts: {exc}', [], True)
-    latest_path = directory / 'receipt.json'
     numbered = []
     evidence_numbers = set()
     for path in files:
@@ -231,25 +251,19 @@ def recover_attempt(directory):
             if match[1] == 'receipt' and match[3] == 'json':
                 numbered.append((current, path))
 
-    # The compatibility receipt is useful for legacy runs, but a numbered record
-    # wins for the same attempt (it is published before the compatibility copy).
-    for current, path in [(None, latest_path), *numbered]:
+    for current, path in numbered:
         try:
             receipt = read_receipt(path)
             if receipt is None:
                 continue
-            if receipt.get('task_id', directory.name) != directory.name:
+            if receipt.get('task_id') != directory.name:
                 raise ValueError('receipt belongs to a different task')
-            receipt.setdefault('task_id', directory.name)
             declared = receipt.get('attempt')
-            if declared is not None and (type(declared) is not int or declared < 1):
+            if type(declared) is not int or declared < 1:
                 raise ValueError('invalid attempt number in receipt')
-            if current is not None and declared not in (None, current):
+            if declared != current:
                 raise ValueError('receipt attempt does not match its filename')
-            current = current if current is not None else declared or 0
             number = max(number, current)
-            if current and declared is None:
-                receipt['attempt'] = current
             records[current] = receipt, path
         except (OSError, ValueError) as exc:
             unreadable = f'cannot read previous attempt evidence {path.name}: {exc}'
@@ -257,30 +271,11 @@ def recover_attempt(directory):
     old, source = records[max(records)] if records else (None, None)
     receipts = [receipt for receipt, _ in records.values()]
     gap = bool(evidence_numbers - records.keys())
-    if number not in records and (number or (directory / 'result.json').exists()):
-        detail = f'no readable receipt for attempt {number}' if number else 'no receipt for the saved result'
+    if number not in records and number:
+        detail = f'no readable receipt for attempt {number}'
         return AttemptEvidence(old, source, number, detail, receipts, True)
     if old is None:
         return AttemptEvidence(None, None, number, unreadable, receipts, bool(unreadable))
-    if source == latest_path and ('execution' in old or 'owner' in old):
-        return AttemptEvidence(old, source, number, 'authoritative numbered receipt is unavailable', receipts, True)
-    # Old versions could synthesize a new no-PID failed attempt while looking up
-    # an already successful task. Such a lookup cannot undo the earlier success.
-    if (old['status'] == 'failed' and 'execution' not in old
-            and not any(old.get(k) for k in ('pid', 'command', 'execution_started_utc', 'result_file'))):
-        error = str(old.get('last_error', ''))
-        for previous in sorted(records, reverse=True):
-            candidate, candidate_source = records[previous]
-            name = candidate.get('result_file', 'result.json')
-            if (candidate['status'] == 'complete' and old.get('input_fingerprint')
-                    and old['input_fingerprint'] == (candidate.get('input_fingerprint') or legacy_fingerprint(candidate))
-                    and (error == 'ValueError: saved completed result is missing or invalid'
-                         or (error.startswith(('FileNotFoundError:', 'PermissionError:'))
-                             and isinstance(name, str) and error.endswith(repr(str(directory / name)))))):
-                old, source = candidate, candidate_source
-                break
-    if source != latest_path and 'result_file' not in old:
-        old['result_file'] = f'result-{old["attempt"]:02d}.json'
     return AttemptEvidence(old, source, number, None, receipts, gap)
 
 
@@ -290,25 +285,11 @@ def next_attempt(directory):
         match = ATTEMPT_FILE.fullmatch(path.name)
         if match:
             numbers.append(int(match[2]))
-    try:
-        old = read_receipt(directory / 'receipt.json')
-        if old and isinstance(old.get('attempt'), int):
-            numbers.append(old['attempt'])
-    except (OSError, ValueError):
-        pass
     return max(numbers) + 1
 
 
-def valid_result(value):
-    return (isinstance(value, dict) and set(value) == {'status', 'summary', 'artifacts', 'issues'}
-            and value['status'] in RESULT_STATES
-            and isinstance(value['summary'], str)
-            and all(isinstance(value[k], list) and all(isinstance(v, str) for v in value[k])
-                    for k in ('artifacts', 'issues')))
-
-
 def read_result(directory, receipt):
-    name = receipt.get('result_file', 'result.json')
+    name = receipt.get('result_file')
     if not isinstance(name, str) or Path(name).name != name or name in ('', '.', '..'):
         raise ValueError('invalid result filename in receipt')
     path = directory / name
@@ -342,46 +323,6 @@ def validate_retry(intent, attempt):
                     for k, upper in (('delay_seconds', 120), ('base_delay', 120), ('ready_at', 1e12))))
 
 
-def legacy_retry_intent(root, directory, receipt):
-    """Import a retry only when the old scheduler's own event committed it."""
-    if (not receipt or 'execution' in receipt or receipt['status'] != 'failed' or not receipt.get('retryable')
-            or receipt.get('cleanup_error') or receipt.get('receipt_error')):
-        return None
-    attempt = receipt.get('attempt')
-    if type(attempt) is not int:
-        return None
-    intent = None
-    if 'automatic_retry_count' not in receipt:
-        run_id = receipt.get('run_id')
-        if not isinstance(run_id, str) or not run_id.isascii() or not run_id.isdecimal():
-            return None
-        run = root / 'runs' / run_id
-        if task_control.is_cancelled(run):
-            return None
-        try:
-            config = json.loads((run / 'config.json').read_text())
-            started_attempt, intent = None, None
-            with (run / 'events.jsonl').open() as events:
-                for line in events:
-                    try:
-                        event = json.loads(line)
-                    except ValueError:
-                        continue
-                    if not isinstance(event, dict) or event.get('task_id') != directory.name:
-                        continue
-                    if event.get('event') == 'worker_started':
-                        started_attempt = (event.get('attempt') if event.get('directory') == str(directory)
-                                           and event.get('pid') == receipt.get('pid') else None)
-                        intent = None
-                    elif event.get('event') == 'retry_scheduled' and started_attempt == attempt:
-                        delay = event['delay_seconds']
-                        intent = dict(next_attempt=attempt + 1, count=event['retry'],
-                                      limit=config['max_retries'], delay_seconds=delay,
-                                      base_delay=config['retry_backoff_seconds'],
-                                      ready_at=datetime.fromisoformat(event['utc']).timestamp() + delay)
-        except (OSError, ValueError, KeyError, TypeError, AttributeError, OverflowError):
-            return None
-    return intent if validate_retry(intent, attempt) else None
 
 
 def transient_error(message):
@@ -427,18 +368,17 @@ async def finish_cleanup(awaitable):
             cancelled = True
 
 
-def format_report(root, jobs, final):
-    """Human-readable per-task results; stdout remains the existing JSON stream."""
+def format_report(jobs, final, result_rows):
+    """Render the already published results for the terminal."""
     labels = {'complete': '已完成', 'partial': '部分完成', 'blocked': '阻塞',
               'failed': '失败', 'interrupted': '已中断', 'not_started': '未启动'}
+    totals = '，'.join(f'{labels.get(s, s)} {n}' for s, n in final['counts'].items()) or '无任务'
     if len(jobs) > 20:
-        counts = Counter(final['results'].get(j['id'], {}).get('status', 'not_started') for j in jobs)
-        totals = '，'.join(f'{labels.get(s, s)} {n}' for s, n in counts.items())
         return (f'\n批次结束：{totals}\n复用 {len(final.get("reused", []))} 项。'
-                f'\n简报：{final.get("report_path", final["summary_path"])}'
-                f'\n详细结果：{final["summary_path"]}')
+                f'\n简报：{final["report_path"]}'
+                f'\n详细结果：{final["results_path"]}')
     reused = set(final.get('reused', []))
-    rows, counts = [], {}
+    rows = []
 
     def clean(value):
         return ' '.join(''.join(c if not unicodedata.category(c).startswith('C')
@@ -451,21 +391,13 @@ def format_report(root, jobs, final):
     for job in jobs:
         task_id = job['id']
         receipt = final['results'].get(task_id, {})
-        status = receipt.get('status', 'not_started')
-        counts[status] = counts.get(status, 0) + 1
-        reasons = []
-        if status in ('failed', 'interrupted'):
-            reasons = [receipt[k] for k in ('last_error', 'receipt_error', 'cleanup_error', 'log_error')
-                       if receipt.get(k)]
-        elif status in RESULT_STATES:
-            try:
-                result, _ = read_result(root / 'workers' / task_id, receipt)
-                if status != 'complete':
-                    reasons.extend([result['summary'], *result['issues']])
-            except (OSError, ValueError, TypeError):
-                reasons.append('结果文件不可读取，详见任务回执')
-        elif status == 'not_started':
+        result = result_rows[task_id]
+        status = result['status']
+        reasons = result_issues(result)
+        if status == 'not_started':
             reasons = ['本轮未启动']
+        elif status in RESULT_STATES and (status != 'complete' or result.get('needs_attention')):
+            reasons.insert(0, result['answer'])
         task = job['title'] if job['title'] == task_id else f'{job["title"]} [{task_id}]'
         row = [task, receipt.get('pid'), labels.get(status, status), receipt.get('exit_code'),
                receipt.get('attempt'), '历史' if task_id in reused else '本轮' if receipt else '—',
@@ -478,14 +410,13 @@ def format_report(root, jobs, final):
         return '  '.join(value + ' ' * (widths[i] - width(value))
                          for i, value in enumerate(row[:-1])) + '  ' + row[-1]
 
-    totals = '，'.join(f'{labels.get(s, s)} {n}' for s, n in counts.items()) or '无任务'
     output = ['', f'批次结束：{totals}', '', line(header)]
     for row in rows:
         reason_lines = textwrap.wrap(row[-1], width=60) or ['—']
         output.append(line([*row[:-1], reason_lines[0]]))
         output.extend(line([''] * (len(header)-1) + [part]) for part in reason_lines[1:])
     output += ['', '来源为“历史”表示本轮未重跑，PID 和退出码来自之前的执行。' if reused else '',
-               f'详细结果：{final["summary_path"]}']
+               f'详细结果：{final["results_path"]}']
     return '\n'.join(output)
 
 
@@ -526,8 +457,9 @@ class Batch:
             job['_queued_at'] = self.started
         self.status_path = root / ('status-' + Path(args.manifest).stem + '.json')
         common = self.run_dir / 'common.md'
-        common.write_text(jobs[0]['_common'] if jobs else (root / 'COMMON.md').read_text())
+        common.write_text(jobs[0]['_common'] if jobs else read_common(root))
         metadata = {j['id']: {**{k: j[k] for k in ('title', 'model', 'effort', 'prompt')},
+                              **{k: j['_spec'][k] for k in MULTI_AGENT_FIELDS if k in j['_spec']},
                               'web_search': j.get('web_search', 'disabled'),
                               'task_timeout_seconds': j.get('task_timeout_seconds', args.timeout_seconds),
                               'idle_warning_seconds': j.get('idle_warning_seconds',
@@ -597,7 +529,6 @@ class Batch:
                         pending=len(self.queued) + len(self.retrying), running=len(running_ids),
                         active_model_turns=self.active_turns(), counts=counts,
                         peak_workers=self.peak_running, peak_active_turns=self.peak_turns,
-                        automatic_retries=sum(self.retries.values()),
                         automatic_retries_started=self.automatic_retries_started,
                         mem_available_kib=available_kib(),
                         waiting_for_memory=state == 'running' and self.waiting_for_memory,
@@ -633,10 +564,10 @@ class Batch:
         directory = self.root / 'workers' / task_id
         receipt_path = self.receipt_paths.get(task_id)
         if receipt and (receipt_path is None or not receipt_path.is_file()):
-            # Unknown or legacy outcomes need an invocation-local snapshot.
+            # Unknown outcomes need an invocation-local snapshot.
             receipt_path = self.receipt_snapshot(task_id, receipt)
         row = dict(id=task_id, title=job['title'], status=receipt.get('status', 'not_started'),
-                   summary='', artifacts=[], issues=[], attempt=receipt.get('attempt'),
+                   answer='', issues=[], attempt=receipt.get('attempt'),
                    execution_elapsed_seconds=receipt.get('execution_elapsed_seconds'),
                    queue_wait_seconds=receipt.get('queue_wait_seconds'),
                    retry_backoff_seconds=receipt.get('retry_backoff_seconds', 0),
@@ -653,10 +584,6 @@ class Batch:
             observation, result, path, issue = result_observation(directory, receipt)
             row['result_observation'] = observation
             if result is not None:
-                if path.name == 'result.json':
-                    path = self.run_dir / 'legacy-results' / f'{task_id}.json'
-                    path.parent.mkdir(exist_ok=True)
-                    write_json(path, result)
                 row.update(result, result_path=str(path))
                 row['reported_status'] = result['status']
             elif issue:
@@ -665,7 +592,7 @@ class Batch:
                              if receipt.get(k) and (k != 'last_error' or receipt.get('status') != 'complete'))
         if row['status'] == 'not_started':
             row['issues'].append('not started in this invocation')
-        row['needs_attention'] = row['status'] != 'complete' or bool(row['issues'])
+        row['needs_attention'] = needs_attention(row)
         return row
 
     def commit_result(self, job):
@@ -679,10 +606,10 @@ class Batch:
             out.flush()
         self.cursor = row['cursor']
         self.final_rows[job['id']] = row
-        if row['status'] != 'complete' or row['issues']:
+        if row['needs_attention']:
             self.attention_count += 1
 
-    def save_summary(self, state):
+    def save_report(self, state):
         """Full evidence stays on disk; the controller reads one bounded report."""
         result_index = self.run_dir / 'results.jsonl'
         attention_path = self.run_dir / 'attention.jsonl'
@@ -694,11 +621,11 @@ class Batch:
                 counts[row['status']] += 1
                 line = json.dumps(row, ensure_ascii=False) + '\n'
                 results.write(line)
-                if row['status'] != 'complete' or row['issues']:
+                if row['needs_attention']:
                     attention.write(line)
                     attention_count += 1
                     if len(preview) < 20:
-                        preview.append(dict(id=row['id'], status=row['status'], summary=row['summary'][:500],
+                        preview.append(dict(id=row['id'], status=row['status'], answer=row['answer'][:500],
                                             issues=[v[:300] for v in row['issues'][:3]]))
         report = dict(run_id=self.run_dir.name, batch_id=str(self.run_dir), cursor=self.cursor,
                       state=state, completed_utc=stamp(), total=len(self.jobs),
@@ -706,14 +633,13 @@ class Batch:
                       elapsed_seconds=round(time.monotonic() - self.started, 2),
                       batch_elapsed_seconds=round(time.monotonic() - self.started, 2),
                       peak_workers=self.peak_running, peak_active_turns=self.peak_turns,
-                      reused_count=len(self.reused), automatic_retries=sum(self.retries.values()),
+                      reused_count=len(self.reused),
                       automatic_retries_started=self.automatic_retries_started,
                       attention_count=attention_count, attention_preview=preview,
                       results_path=str(result_index), attention_path=str(attention_path),
-                      summary_path=str(self.run_dir / 'summary.json'), report_path=str(self.run_dir / 'report.json'))
+                      report_path=str(self.run_dir / 'report.json'))
         final = dict(**report, results=self.results,
                      unstarted=[j['id'] for j in self.jobs if j['id'] not in self.results], reused=sorted(self.reused))
-        write_json(self.run_dir / 'summary.json', final)
         write_json(self.run_dir / 'report.json', report)
         return final
 
@@ -730,7 +656,7 @@ class Batch:
                     self.receipt_paths[task_id] = self.save_receipt(directory, receipt)
                 except OSError as exc:
                     receipt = {**receipt, 'receipt_error': f'could not save recovered receipt: {exc}'}
-            elif receipt is old and source != directory / 'receipt.json':
+            elif receipt is old:
                 self.receipt_paths[task_id] = source
             if (job.get('_control') or {}).get('phase') == 'running' and receipt.get('execution') == 'succeeded':
                 try:
@@ -786,16 +712,9 @@ class Batch:
             result_path = directory / f'result-{attempt:02d}.json'
             receipt['result_file'] = result_path.name
             receipt['prompt_sha256'] = job['_spec']['prompt_sha256']
-            # Preserve pre-upgrade receipts/results before refreshing the compatibility files.
-            if old and source == directory / 'receipt.json' and isinstance(old.get('attempt'), int):
-                for name in ('receipt', 'result'):
-                    compatibility = directory / f'{name}.json'
-                    archive = directory / f'{name}-{old["attempt"]:02d}.json'
-                    if compatibility.exists() and not archive.exists():
-                        archive.write_bytes(compatibility.read_bytes())
             cmd = [str(SCRIPTS / 'codexexec'), '--' + self.args.channel, '--ignore-user-config',
                    '-c', 'approval_policy="never"', '--skip-git-repo-check',
-                   '--disable', 'apps', '--disable', 'multi_agent', '--disable', 'memories',
+                   '--disable', 'apps', *multi_agent_args(job['_spec']), '--disable', 'memories',
                    '--disable', 'browser_use', '--disable', 'computer_use', '-s', 'workspace-write',
                    '-m', job['model'], '-c', 'model_reasoning_effort=' + json.dumps(job['effort']),
                    '-c', 'web_search=' + json.dumps(job.get('web_search', 'disabled')),
@@ -897,7 +816,7 @@ class Batch:
             if not successful_exit(receipt):
                 receipt['retryable'] = bool(receipt.get('transient_error'))
                 raise ValueError(receipt.get('last_error') or f'worker did not complete successfully (exit {code})')
-            # Execution success is authority; result parsing and aliases are observations.
+            # Record execution success separately from reading the worker's answer.
             receipt.update(execution='succeeded', status='blocked', reported_status='unknown')
             receipt.pop('last_error', None)
             self.save_receipt(directory, receipt)
@@ -905,10 +824,6 @@ class Batch:
             receipt['result_observation'] = observation
             if result is not None:
                 receipt.update(status=result['status'], reported_status=result['status'])
-                try:
-                    write_json(directory / 'result.json', result)
-                except OSError as exc:
-                    receipt['projection_error'] = f'could not refresh compatibility result: {exc}'
         except asyncio.CancelledError:
             cancelled = True
             if receipt['execution'] != 'succeeded':
@@ -951,11 +866,6 @@ class Batch:
                         receipt['log_error'] = f'closing worker log: {exc}'
                 receipt['end_utc'] = stamp()
                 try:
-                    if receipt['execution'] != 'succeeded':
-                        try:
-                            (directory / 'result.json').unlink(missing_ok=True)
-                        except OSError as exc:
-                            receipt['projection_error'] = f'could not clear compatibility result: {exc}'
                     self.receipt_paths[task_id] = self.save_receipt(directory, receipt)
                     with task_control.locked(self.root):
                         current = task_control.read(directory)
@@ -984,10 +894,6 @@ class Batch:
     def save_receipt(directory, receipt):
         path = directory / f'receipt-{receipt["attempt"]:02d}.json'
         write_json(path, receipt)
-        try:
-            write_json(directory / 'receipt.json', receipt)
-        except OSError as exc:
-            receipt['projection_error'] = f'could not refresh compatibility receipt: {exc}'
         return path
 
     def plan_retry(self, job, receipt, policy):
@@ -1128,12 +1034,12 @@ class Batch:
             self.inflight.clear()
             self.retrying.clear()
             self.queued = {j['id'] for j in self.jobs if j['id'] not in self.results}
-            final = self.save_summary(state)
-            self.publish(state, summary_path=final['summary_path'], report_path=final['report_path'],
-                         attention_count=final['attention_count'], ok=final['ok'])
+            final = self.save_report(state)
+            self.publish(state, report_path=final['report_path'],
+                         attention_count=final['attention_count'], reused_count=final['reused_count'], ok=final['ok'])
             # A closed output pipe must not turn a saved batch result into a failure.
             try:
-                print(format_report(self.root, self.jobs, final), file=sys.stderr, flush=True)
+                print(format_report(self.jobs, final, self.final_rows), file=sys.stderr, flush=True)
             except (OSError, ValueError):
                 pass
 
@@ -1165,7 +1071,7 @@ def recovery_decision(root, directory, job, args):
     except (OSError, ValueError) as exc:
         control, control_error = None, f'cannot read task scheduling state: {exc}'
     job['_control'] = control
-    previous = (old and (old.get('input_fingerprint') or legacy_fingerprint(old)))
+    previous = old and old.get('input_fingerprint')
     if (old and previous != job['_fingerprint']) or (control and control['input_fingerprint'] != job['_fingerprint']):
         raise ConfigurationError(f'task {job["id"]}: inputs/configuration changed or old inputs cannot be verified; '
                                  'use a new task ID or run directory (no tasks launched)')
@@ -1173,13 +1079,12 @@ def recovery_decision(root, directory, job, args):
         control_error = 'task scheduling state and latest attempt evidence disagree'
 
     # Confirmed success is monotonic, even when the model result was not recorded.
-    if old and (old.get('execution') == 'succeeded' or successful_exit(old)
-                or old['status'] in RESULT_STATES):
+    if old and (old.get('execution') == 'succeeded' or successful_exit(old)):
         if problem:
             return 'review', {**review_outcome(job, old, number, problem),
                               'execution': 'succeeded' if old.get('attempt', 0) == number else 'unknown',
                               'result_observation': 'unavailable'}
-        reported = old.get('reported_status', old['status'] if old['status'] in RESULT_STATES else 'unknown')
+        reported = old.get('reported_status', 'unknown')
         if old['status'] not in RESULT_STATES or old.get('reported_status') == 'unknown':
             updated = {**old, 'task_id': job['id'], 'execution': 'succeeded',
                        'status': 'blocked', 'reported_status': 'unknown', 'recovery_state': 'recovered'}
@@ -1221,8 +1126,7 @@ def recovery_decision(root, directory, job, args):
         if old['status'] != 'failed' or not validate_retry(intent, old.get('attempt', 0)):
             return 'review', review_outcome(job, old, number, 'previous retry authorization cannot be verified')
     else:
-        # Modern receipts and controls never derive authorization from log output.
-        intent = legacy_retry_intent(root, directory, old) if control is None else None
+        intent = None
     if intent and (job.get('retry_safe') or not old.get('tools_observed')):
         job['_resume_retry'] = intent
         return 'resume', None
@@ -1233,7 +1137,7 @@ def recovery_decision(root, directory, job, args):
 
 def prepare_jobs(root, args):
     jobs = load_jobs(root, args)
-    common = (root / 'COMMON.md').read_text()
+    common = read_common(root)
     for job in jobs:
         directory = root / 'workers' / job['id']
         # Share COMMON in memory instead of storing a full copy for every queued job.
@@ -1252,21 +1156,20 @@ async def main():
     action = ap.add_mutually_exclusive_group()
     action.add_argument('--init', action='store_true')
     action.add_argument('--submit', action='store_true', help='Start a detached batch and return its durable handle')
-    action.add_argument('--wait', action='store_true', help='Wait for attention or completion; never cancels execution')
+    action.add_argument('--wait', action='store_true', help='Receive unread final answers; delivered task IDs are remembered per batch')
     action.add_argument('--cancel', action='store_true', help='Stop this invocation and its owned workers')
-    action.add_argument('--status', action='store_true', help='Read compact current status without scanning workers')
+    action.add_argument('--status', action='store_true', help='Read compact current batch status')
     action.add_argument('--report', action='store_true', help='Read the bounded final report, or current status if running')
     action.add_argument('--results', action='store_true', help='Read a page of final task results')
     ap.add_argument('--attention', action='store_true', help='With --results, show only tasks needing attention')
-    ap.add_argument('--offset', type=int, default=0)
     ap.add_argument('--limit', type=int, default=20, help='Result page size (1–100)')
-    ap.add_argument('--after', type=int, help='Read result changes after this cursor; pass the returned cursor next time')
+    ap.add_argument('--after', type=int, help='Explicit result cursor; with --wait, replay without changing automatic delivery state')
     ap.add_argument('--wait-seconds', type=float, default=60, help='Bound this wait/cancel call, 0–60s; not an execution timeout')
     ap.add_argument('--channel', choices=('sub', 'api'), default='sub')
     ap.add_argument('--manifest', default='tasks.json')
-    ap.add_argument('--concurrency', type=int, default=8)
+    ap.add_argument('--concurrency', type=int, default=24)
     ap.add_argument('--ramp-seconds', type=int, default=20)
-    ap.add_argument('--task-timeout-seconds', '--timeout-seconds', dest='timeout_seconds',
+    ap.add_argument('--task-timeout-seconds', dest='timeout_seconds',
                     type=float, default=0,
                     help='Per EXEC attempt time limit after launch, excluding queue/backoff; 0 disables (default)')
     ap.add_argument('--idle-warning-seconds', type=float, default=600,
@@ -1289,8 +1192,8 @@ async def main():
     if (not 0 <= args.max_retries <= 10 or not 0 <= args.retry_backoff_seconds <= 120
             or not .1 <= args.status_interval_seconds <= 60):
         ap.error('retries must be 0–10, backoff 0–120s, status interval 0.1–60s')
-    if args.offset < 0 or not 1 <= args.limit <= 100 or (args.attention and not args.results):
-        ap.error('--results accepts --offset >= 0, --limit 1–100, and optional --attention')
+    if not 1 <= args.limit <= 100 or (args.attention and not args.results):
+        ap.error('--results accepts --limit 1–100 and optional --attention')
     if args.cancel and not args.batch:
         ap.error('--cancel requires an explicit --batch')
     reader = args.status or args.report or args.results or args.wait or args.cancel
@@ -1304,12 +1207,6 @@ async def main():
         if root is not None and root != batch_root:
             ap.error('--batch belongs to a different --run-dir')
         root = batch_root
-        if not args.cancel:
-            for name in ('config.json', 'submission.json'):
-                if (target / name).is_file():
-                    meta = json.loads((target / name).read_text())
-                    args.manifest = meta.get('manifest', args.manifest)
-                    break
     if root is None:
         ap.error('provide --run-dir for submission or --batch for an existing invocation')
     if args._run_id is not None and (not args._run_id.isdigit() or reader or args.submit or args.init):
@@ -1333,16 +1230,17 @@ async def main():
                 target = control.latest_submission(root, args.manifest)
                 if target is None:
                     raise ConfigurationError('no invocation recorded for this manifest; use --batch for an existing invocation')
-            status = control.read_status(target)
             if args.wait:
-                result = control.wait_for_event(target, args.after or 0, args.wait_seconds, args.limit)
+                result = control.wait_for_event(target, args.after, args.wait_seconds, args.limit)
             elif args.results:
                 result = control.results_page(target, after_cursor=args.after, attention=args.attention,
-                                              offset=args.offset, limit=args.limit)
-            elif args.report and status.get('state') in ('complete', 'interrupted') and status.get('report_path'):
-                result = json.loads(Path(status['report_path']).read_text())
+                                              limit=args.limit)
             else:
-                result = compact_status(status)
+                status = control.read_status(target)
+                if args.report and status.get('state') in ('complete', 'interrupted') and status.get('report_path'):
+                    result = json.loads(Path(status['report_path']).read_text())
+                else:
+                    result = compact_status(status)
             if not scoped_reader:
                 active = control.active_batch(root)
                 result = {**result, 'latest_submission': str(target), 'active_batch': str(active) if active else None}

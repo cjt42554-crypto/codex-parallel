@@ -5,11 +5,13 @@ import importlib.util
 import json
 from pathlib import Path
 import tempfile
+import sys
 import unittest
 from unittest.mock import Mock, patch
 
 
 SOURCE = Path(__file__).resolve().parents[1] / 'scripts' / 'dashboard.py'
+sys.path.insert(0, str(SOURCE.parent))
 SPEC = importlib.util.spec_from_file_location('dashboard', SOURCE)
 dashboard = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(dashboard)
@@ -54,27 +56,54 @@ class DashboardTests(unittest.TestCase):
 
     def worker(self, task_id, *, attempt=1, status='complete', root=None):
         directory = (root or self.root) / 'workers' / task_id
-        write_json(directory / 'receipt.json', status=status, attempt=attempt,
+        write_json(directory / f'receipt-{attempt:02d}.json', status=status, attempt=attempt,
                    result_file=f'result-{attempt:02d}.json')
         (directory / f'prompt-{attempt:02d}.txt').write_text(f'sent {task_id}/{attempt}')
-        write_json(directory / f'result-{attempt:02d}.json', summary=f'answer {task_id}/{attempt}')
+        write_json(directory / f'result-{attempt:02d}.json', status=status, answer=f'answer {task_id}/{attempt}')
         return directory
 
     def register(self, root, time=1):
-        write_json(self.registry / 'batches' / f'{root.name}.json', run_dir=str(root), registered_at=time)
+        write_json(self.registry / 'batches' / f'{root.name}.json', run_dir=str(root), manifest='tasks.json',
+                   registered_at=time)
 
     def status(self, root=None, **changes):
+        root = root or self.root
         status = dict(run_id='1', pid=123, manifest='tasks.json', state='running', total=3,
                       counts={}, pending=0, running=0, running_ids=[], queued_ids=[], retrying_ids=[],
                       selected_ids=[])
         status.update(changes)
-        write_json((root or self.root) / 'status-tasks.json', **status)
+        run = root / 'runs' / status['run_id']
+        status['batch_id'] = str(run)
+        manifest = root / status['manifest']
+        jobs = dashboard.manifest_jobs(json.loads(manifest.read_text())) if manifest.is_file() else []
+        (run / 'bindings').mkdir(parents=True, exist_ok=True)
+        (run / 'result-events.jsonl').touch()
+        write_json(run / 'config.json', job_metadata={job['id']: job for job in jobs})
+        write_json(root / 'status-tasks.json', **status)
+        return run
+
+    def finished(self, ids, *, attempts=None, run_id='1'):
+        run = self.status(state='complete', selected_ids=ids, run_id=run_id)
+        (run / 'result-events.jsonl').write_text(''.join(
+            json.dumps(dict(id=task_id, status='complete', attempt=(attempts or {}).get(task_id, 1))) + '\n'
+            for task_id in ids))
+
+    def test_unsubmitted_tasks_show_manifest_preview(self):
+        self.manifest('a')
+        (self.root / 'COMMON.md').write_text('shared draft')
+        with observe_reads() as reads:
+            row, = dashboard.snapshot(self.root, 'tasks.json')['tasks']
+        self.assertEqual((row['status'], row['attempt'], row['model']), ('not_started', 0, 'worker'))
+        self.assertTrue(row['prompt'].startswith('shared draft\n\ndraft a\n'))
+        self.assertFalse(row['prompt_sent'])
+        self.assertFalse(any('runs' in p.parts or 'workers' in p.parts for p in reads))
 
     def test_ui_reads_only_selected_attempt_details(self):
         ids = [f'task{i:02d}' for i in range(25)]
         self.manifest(*ids)
         for task_id in ids:
             self.worker(task_id)
+        self.finished(ids)
         screen = Mock()
         screen.getmaxyx.return_value = (28, 110)
         screen.getch.side_effect = [-1, ord('j'), -1, ord('q')]
@@ -91,15 +120,17 @@ class DashboardTests(unittest.TestCase):
         self.manifest(*ids)
         for task_id in ids:
             self.worker(task_id)
+        self.finished(ids)
         view = dashboard.BatchView(self.root, 'tasks.json')
         _, rows = view.rows()
         with observe_reads() as reads:
             self.assertEqual(view.detail(rows[0])['answer'], 'answer 0/1')
             self.assertEqual(view.detail(rows[0])['prompt'], 'sent 0/1')
-        self.assertEqual([p.name for p in reads], ['prompt-01.txt', 'result-01.json'])
-        write_json(self.root / 'workers/0/result-01.json', summary='replacement')
+        self.assertEqual([p.name for p in reads], ['receipt-01.json', 'prompt-01.txt', 'result-01.json'])
+        write_json(self.root / 'workers/0/result-01.json', status='complete', answer='replacement')
         self.assertEqual(view.detail(rows[0])['answer'], 'replacement')
         self.worker('0', attempt=2)
+        self.finished(ids, attempts={'0': 2}, run_id='2')
         _, rows = view.rows()
         self.assertEqual(view.detail(rows[0])['answer'], 'answer 0/2')
         self.assertEqual(view.detail(rows[0])['prompt'], 'sent 0/2')
@@ -108,15 +139,16 @@ class DashboardTests(unittest.TestCase):
         self.assertLess(len(view.details.entries), len(rows))
         with observe_reads() as reads:
             view.detail(rows[0])
-        self.assertEqual([p.name for p in reads], ['prompt-02.txt', 'result-02.json'])
+        self.assertEqual([p.name for p in reads], ['receipt-02.json', 'prompt-02.txt', 'result-02.json'])
 
     def test_current_queue_and_retry_hide_old_receipts_and_attempt_details(self):
         self.manifest('queued', 'retry', 'finished')
         self.worker('queued')
         self.worker('retry', status='failed')
         self.worker('finished')
-        self.status(queued_ids=['queued', 'retry'], retrying_ids=['retry'],
-                    selected_ids=['queued', 'retry', 'finished'])
+        run = self.status(queued_ids=['queued', 'retry'], retrying_ids=['retry'],
+                          selected_ids=['queued', 'retry', 'finished'])
+        (run / 'result-events.jsonl').write_text(json.dumps(dict(id='finished', status='complete', attempt=1)) + '\n')
         with patch.object(dashboard, 'live', return_value=True), observe_reads() as reads:
             data = dashboard.snapshot(self.root, 'tasks.json')
         self.assertTrue(data['scheduler_live'])
@@ -129,14 +161,14 @@ class DashboardTests(unittest.TestCase):
         self.assertFalse(any(p.parent.name in ('queued', 'retry') for p in reads))
         with patch.object(dashboard, 'live', return_value=False):
             rows = dashboard.snapshot(self.root, 'tasks.json', include_prompts=False)['tasks']
-        self.assertEqual([row['status'] for row in rows], ['complete', 'failed', 'complete'])
+        self.assertEqual([row['status'] for row in rows], ['not_started', 'not_started', 'complete'])
 
     def test_overview_uses_only_registry_and_aggregate_for_modern_batches(self):
         other = self.base / 'other'
         self.register(self.root)
         self.register(other, time=2)
-        write_json(self.registry / 'latest.json', run_dir=str(self.root), registered_at=1)
-        self.status(counts={'complete': 1, 'retrying': 1}, pending=1, running=1)
+        write_json(self.registry / 'latest.json', run_dir=str(self.root), manifest='tasks.json', registered_at=1)
+        self.status(counts={'complete': 1, 'retrying': 1, 'running': 1}, pending=1, running=1)
         self.status(other, state='complete', total=2, counts={'complete': 1, 'failed': 1})
         overview = dashboard.Overview()
         with (patch.object(dashboard.BatchView, 'rows', side_effect=AssertionError('worker scan')),
@@ -154,28 +186,6 @@ class DashboardTests(unittest.TestCase):
             self.status(state='interrupted', counts={'complete': 1, 'interrupted': 2})
             self.assertFalse(any(row['active'] for row in overview.rows()))
             self.assertEqual(reads, [self.root / 'status-tasks.json'])
-
-    def test_legacy_overview_caches_stopped_batch_until_new_run(self):
-        self.root.mkdir()
-        (self.root / 'tasks.json').write_text(json.dumps([{'id': 'one'}]))
-        worker = self.worker('one')
-        config = self.root / 'runs/1/config.json'
-        write_json(config, jobs=['one'])
-        self.register(self.root)
-        overview = dashboard.Overview()
-        with observe_reads() as reads:
-            self.assertEqual(overview.rows()[0]['complete'], 1)
-            self.assertIn(config, reads)
-            self.assertIn(worker / 'receipt.json', reads)
-            self.assertNotIn(worker / 'result-01.json', reads)
-            reads.clear()
-            self.assertEqual(overview.rows()[0]['complete'], 1)
-            self.assertEqual(reads, [])
-            self.worker('one', attempt=2, status='failed')
-            newer = self.root / 'runs/2/config.json'
-            write_json(newer, jobs=['one'])
-            self.assertEqual(overview.rows()[0]['counts']['failed'], 1)
-            self.assertIn(newer, reads)
 
     def test_launcher_falls_back_on_spawn_error_or_unsuccessful_exit(self):
         command = ['python', 'dashboard.py']

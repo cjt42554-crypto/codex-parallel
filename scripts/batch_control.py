@@ -19,6 +19,7 @@ from typing import NamedTuple
 
 import process_ownership as ownership
 import task_control
+from result_contract import needs_attention as _needs_attention
 
 DISPATCHER = Path(__file__).resolve().with_name('dispatch.py')
 STARTUP_WAIT_SECONDS = 5.0
@@ -168,14 +169,6 @@ def _log_error(path, default):
     return lines[-1][:500] if lines else default
 
 
-def _worker_records(snapshot):
-    workers = snapshot.get('running_workers') or {}
-    if not isinstance(workers, dict):
-        return {}
-    return {str(task): {**rec, 'boot_id': rec.get('boot_id') or snapshot.get('boot_id')}
-            for task, rec in workers.items() if isinstance(rec, dict)}
-
-
 def _check_owner(data, run_dir):
     if (str(data.get('run_id', run_dir.name)) != run_dir.name or
             data.get('batch_id', str(run_dir)) != str(run_dir)):
@@ -216,28 +209,7 @@ def register_submission(run_dir):
 
 def latest_submission(root, manifest='tasks.json') -> Path | None:
     root = Path(root).expanduser().resolve()
-    index = _read_json(_latest_path(root, manifest))
-    if index is not None:
-        return _read_handle(root, index)
-    # Older invocations predate the index. Submission/config are more authoritative
-    # than the manifest heartbeat, which could belong to a different invocation.
-    runs = root / 'runs'
-    if not runs.is_dir():
-        return None
-    key = _latest_path(root, manifest)
-    for candidate in sorted((p for p in runs.iterdir() if p.is_dir() and
-                             p.name.isascii() and p.name.isdecimal()),
-                            key=lambda p: int(p.name), reverse=True):
-        meta = _read_json(candidate / 'submission.json') or _read_json(candidate / 'config.json')
-        if meta and _latest_path(root, meta.get('manifest', 'tasks.json')) == key:
-            _check_owner(meta, candidate)
-            return candidate
-    old = _read_json(root / ('status-' + Path(manifest).stem + '.json'))
-    if old and old.get('run_id'):
-        return _handle(runs / str(old['run_id']))
-    if old and old.get('summary_path'):
-        return _read_handle(root, {'batch_id': str(Path(old['summary_path']).parent)})
-    return None
+    return _read_handle(root, _read_json(_latest_path(root, manifest)))
 
 
 def register_active_batch(run_dir):
@@ -250,18 +222,11 @@ def active_batch(root) -> Path | None:
     root = Path(root).expanduser().resolve()
     if not _root_lock_held(root):
         return None
-    pointer = _read_json(root / '.active-batch.json')
-    if pointer is not None:
-        run = _read_handle(root, pointer)
+    run = _read_handle(root, _read_json(root / '.active-batch.json'))
+    if run is not None:
         status = read_status(run)
         if status['scheduler_live'] is True or status['state'] == 'orphaned':
             return run
-        return None
-    # A currently running dispatcher may predate the separate pointer.
-    for path in sorted(root.glob('status-*.json')):
-        old = _read_json(path)
-        if old and old.get('run_id') and _live(old, _boot_id()) is True:
-            return _handle(root / 'runs' / str(old['run_id']))
     return None
 
 
@@ -295,11 +260,9 @@ def _read_status(run_dir, boot_id, *, inspect_workers=True):
         _check_owner(snapshot, run_dir)
         live = _live(snapshot, boot_id)
     state = snapshot.get('state')
-    result = {**snapshot, **_paths(run_dir), 'scheduler_live': live,
-              'heartbeat_utc': snapshot.get('heartbeat_utc', snapshot.get('utc')),
-              'cursor': snapshot.get('cursor', 0)}
+    result = {**snapshot, **_paths(run_dir), 'scheduler_live': live}
     if state == 'running' and live is False and inspect_workers:
-        records, uncertain, _ = _attempt_records(run_dir, snapshot)
+        records, uncertain, _ = _attempt_records(run_dir)
         workers = {}
         for (task, _), (rec, directory) in records.items():
             observation = ownership.scan_owned(rec, directory, persist=False)
@@ -403,17 +366,6 @@ def _deadline(wait_seconds):
     return time.monotonic() + seconds
 
 
-def _index(run_dir, status):
-    live = run_dir / 'result-events.jsonl'
-    if live.is_file() or status['state'] not in ('complete', 'interrupted'):
-        return live, False
-    return run_dir / 'results.jsonl', True
-
-
-def _needs_attention(row):
-    return row.get('status') != 'complete' or bool(row.get('issues'))
-
-
 def _page_size(limit):
     if type(limit) is not int or not 1 <= limit <= 100:
         raise ValueError('limit must be an integer between 1 and 100')
@@ -424,20 +376,20 @@ def _nonnegative(value, name):
         raise ValueError(f'{name} must be a nonnegative integer')
 
 
-def _rows(stream, legacy, path, previous=0):
+def _rows(stream, path, previous=0):
     while True:
         position = stream.tell()
         line = stream.readline()
         if not line:
             return
-        if not legacy and not line.endswith(b'\n'):
+        if not line.endswith(b'\n'):
             stream.seek(position)
             return  # Retry from this byte when the producer finishes the row.
         try:
             row = json.loads(line)
             if not isinstance(row, dict):
                 raise ValueError('expected a result object')
-            cursor = previous + 1 if legacy else row.get('cursor')
+            cursor = row.get('cursor')
             if type(cursor) is not int or cursor <= 0:
                 raise ValueError('expected a positive result cursor')
             if cursor <= previous:
@@ -445,63 +397,61 @@ def _rows(stream, legacy, path, previous=0):
         except ValueError as exc:
             raise ValueError(f'{path}: {exc}') from exc
         previous = cursor
-        yield {**row, 'cursor': cursor}
+        yield row
 
 
-def _page(path, legacy, after, attention, offset, limit):
+def _page(path, after, attention, limit):
     items = []
-    cursor, high_watermark, total = after or 0, 0, 0
+    cursor, high_watermark, total = after, 0, 0
     try:
         stream = path.open('rb')
     except FileNotFoundError:
         stream = None
     if stream is not None:
         with stream:
-            for row in _rows(stream, legacy, path):
+            for row in _rows(stream, path):
                 mark = row['cursor']
                 high_watermark = max(high_watermark, mark)
                 matches = not attention or _needs_attention(row)
                 total += matches
-                if len(items) >= limit or mark <= (after or 0):
+                if len(items) >= limit or mark <= after:
                     continue
                 cursor = mark
-                if matches and (after is not None or total > offset):
+                if matches:
                     items.append(row)
-    following = offset + len(items)
     return dict(items=items, cursor=cursor, high_watermark=high_watermark, total=total, limit=limit,
-                offset=offset if after is None else None,
-                next_offset=following if after is None and following < total else None,
                 results_path=str(path))
 
 
-def results_page(run_dir, after_cursor=None, attention=False, offset=0, limit=20) -> dict:
+def results_page(run_dir, after_cursor=None, attention=False, limit=20) -> dict:
     """Read final task rows, including those committed by a still-running dispatcher."""
     _page_size(limit)
-    _nonnegative(offset, 'offset')
-    if after_cursor is not None:
-        _nonnegative(after_cursor, 'after_cursor')
+    after = 0 if after_cursor is None else after_cursor
+    _nonnegative(after, 'after_cursor')
     run_dir = _handle(run_dir)
     status = _read_status(run_dir, _boot_id())
-    # Keep offsets anchored to the append-only commit order across state changes.
-    path, legacy = _index(run_dir, status)
-    page = _page(path, legacy, after_cursor, attention, offset, limit)
+    page = _page(run_dir / 'result-events.jsonl', after, attention, limit)
     return dict(**page, batch_id=status['batch_id'], state=status['state'])
 
 
-def wait_for_event(run_dir, after_cursor, wait_seconds, limit=20) -> dict:
-    """Coalesce ordinary successes until there is attention, a terminal state, or a timeout."""
+def wait_for_event(run_dir, after_cursor=None, wait_seconds=60, limit=20) -> dict:
+    """Deliver unread task answers; explicit cursors provide independent replay."""
     _page_size(limit)
     cursor = 0 if after_cursor is None else after_cursor
     _nonnegative(cursor, 'after_cursor')
     deadline = _deadline(wait_seconds)
     run_dir = _handle(run_dir)
+    path = run_dir / 'result-events.jsonl'
+    delivered_path = run_dir / 'wait-delivered.json'
+    automatic = after_cursor is None
+    delivered = set((_read_json(delivered_path) or {}).get('task_ids', [])) if automatic else set()
     boot_id = _boot_id()
     last_index = identity = None
     position = previous = 0
     items = []
+    more_results = False
     while True:
         status = _read_status(run_dir, boot_id)
-        path, legacy = _index(run_dir, status)
         try:
             st = path.stat()
             version = (path, st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
@@ -521,24 +471,34 @@ def wait_for_event(run_dir, after_cursor, wait_seconds, limit=20) -> dict:
                         identity = current
                         position = previous = 0
                     stream.seek(position)
-                    for row in _rows(stream, legacy, path, previous):
+                    for row in _rows(stream, path, previous):
                         previous = row['cursor']
                         if previous <= cursor:
                             continue
+                        if automatic and row['id'] in delivered:
+                            cursor = previous
+                            continue
+                        if len(items) == limit:
+                            more_results = True
+                            break
                         cursor = previous
-                        if _needs_attention(row):
-                            items.append(row)
-                            if len(items) == limit:
-                                break
+                        items.append(row)
                     position = stream.tell()
         terminal = status['state'] in TERMINAL_STATES
         if terminal or items or not _pause(deadline):
-            event = 'terminal' if terminal else 'attention' if items else 'timeout'
+            event = 'terminal' if terminal and not more_results else 'result' if items else 'timeout'
+            if automatic and items:
+                delivered.update(row['id'] for row in items)
+                _write_json(delivered_path, {'task_ids': sorted(delivered)})
             return dict(items=items, cursor=cursor, results_path=str(path), limit=limit,
                         batch_id=status['batch_id'], run_id=status['run_id'],
                         state=status['state'], event=event, waiting_timed_out=event == 'timeout',
-                        **{key: status[key] for key in ('error', 'log_path', 'report_path', 'summary_path')
-                           if key in status})
+                        **{key: status[key] for key in ('error', 'log_path', 'report_path')
+                           if key in status},
+                        **({'summary': {key: status[key] for key in
+                                        ('total', 'counts', 'ok', 'attention_count', 'reused_count',
+                                         'batch_elapsed_seconds', 'automatic_retries_started')
+                                        if key in status}} if event == 'terminal' else {}))
 
 
 def _task_name(value):
@@ -560,7 +520,7 @@ def _startup_never_reached_journal(run_dir, config):
                 submission.get('spawn_state') in ('not_started', 'exited'))
 
 
-def _attempt_records(run_dir, snapshot):
+def _attempt_records(run_dir):
     """Find the attempts launched by this batch, including earlier attempts of a task."""
     records = {}
     uncertain = []
@@ -573,15 +533,14 @@ def _attempt_records(run_dir, snapshot):
     except (OSError, ValueError) as exc:
         config = None
         uncertain.append(dict(reason='invocation_config_unverified', error=str(exc)))
-    modern = config is not None and config.get('attempt_journal_version') == 1
     try:
         no_launch = _startup_never_reached_journal(run_dir, config)
     except (OSError, ValueError):
         no_launch = False
     if no_launch:
         return records, uncertain, 'startup_failed_before_launch'
-    if not modern:
-        uncertain.append(dict(reason='legacy_launch_history_incomplete'))
+    if not config or config.get('attempt_journal_version') != 1:
+        uncertain.append(dict(reason='launch_journal_unverified'))
     if workers.is_symlink():
         return records, [*uncertain, dict(reason='worker_directory_is_symlink')], 'unverified'
 
@@ -598,7 +557,7 @@ def _attempt_records(run_dir, snapshot):
             uncertain.append(dict(reason='launch_evidence_unreadable', path=str(path), error=str(exc)))
         return []
 
-    def read(path, *, required=False):
+    def read(path):
         try:
             if path.is_symlink():
                 raise ValueError('evidence is a symlink')
@@ -606,7 +565,7 @@ def _attempt_records(run_dir, snapshot):
         except (OSError, ValueError) as exc:
             uncertain.append(dict(reason='launch_evidence_unreadable', path=str(path), error=str(exc)))
             return None
-        if row is None and required:
+        if row is None:
             uncertain.append(dict(reason='launch_evidence_missing', path=str(path)))
         return row
 
@@ -617,8 +576,7 @@ def _attempt_records(run_dir, snapshot):
 
     # Immutable execution bindings are distinct from the result bindings used by the UI.
     attempts = run_dir / 'attempts'
-    journal_keys = set()
-    for directory in list_dir(attempts, required=modern):
+    for directory in list_dir(attempts, required=True):
         task = directory.name
         if not _task_name(task):
             uncertain.append(dict(reason='invalid_attempt_task', path=str(directory)))
@@ -627,7 +585,7 @@ def _attempt_records(run_dir, snapshot):
             if path.name.endswith('.tmp'):
                 continue  # Uncommitted temp files never grant launch rights.
             attempt = _attempt_number(path.stem) if path.suffix == '.json' else None
-            binding = read(path, required=True) if attempt else None
+            binding = read(path) if attempt else None
             worker = workers / task
             receipt_path = worker / f'receipt-{attempt:02d}.json' if attempt else None
             if (not owned_receipt(binding, task, attempt) or binding.get('source') != 'execution' or
@@ -635,8 +593,7 @@ def _attempt_records(run_dir, snapshot):
                 uncertain.append(dict(reason='invalid_attempt_binding', path=str(path)))
                 continue
             key = task, attempt
-            journal_keys.add(key)
-            receipt = read(receipt_path, required=True)
+            receipt = read(receipt_path)
             if not owned_receipt(receipt, *key) or receipt.get('owner') != binding.get('owner'):
                 # The binding was committed by this batch before spawn. Retain its owner
                 # even if the corresponding receipt is unavailable or has been replaced.
@@ -644,16 +601,14 @@ def _attempt_records(run_dir, snapshot):
                 receipt = binding
             records[key] = (receipt, worker)
 
-    # Check the numbered history, never just receipt.json (another batch can own it).
-    # For a current invocation, selected IDs bound this check; legacy configs may not
-    # list the selection, so consult the whole historical worker directory.
+    # Check exact-batch numbered receipts for attempts absent from the journal.
+    # The task selection bounds the scan when its configuration is readable.
     selected = config.get('jobs') if config else None
     if isinstance(selected, list) and all(_task_name(task) for task in selected):
         worker_dirs = [workers / task for task in sorted(set(selected))]
     else:
         worker_dirs = list_dir(workers)
-        if modern:
-            uncertain.append(dict(reason='selection_unverified'))
+        uncertain.append(dict(reason='selection_unverified'))
     for directory in worker_dirs:
         task = directory.name
         for path in list_dir(directory):
@@ -668,51 +623,8 @@ def _attempt_records(run_dir, snapshot):
                     continue
                 if owned_receipt(receipt, task, attempt):
                     records[task, attempt] = (receipt, directory)
-                    if modern and (task, attempt) not in journal_keys:
-                        uncertain.append(dict(reason='attempt_missing_from_journal', path=str(path)))
-        if not modern:
-            receipt = read(directory / 'receipt.json') if directory.is_dir() and not directory.is_symlink() else None
-            if receipt and receipt.get('batch_id') == str(run_dir) and receipt.get('task_id') == task:
-                attempt = _attempt_number(receipt.get('attempt'))
-                records.setdefault((task, attempt or 0), (receipt, directory))
-
-    if not modern:
-        # Pre-journal versions wrote start events and snapshots. A later finish event
-        # is no proof that this attempt's detached children exited.
-        def legacy_record(task, rec):
-            if not _task_name(task):
-                return
-            attempt = _attempt_number(rec.get('attempt')) or 0
-            pid = rec.get('pid')
-            if any(key[0] == task and val[0].get('pid') == pid for key, val in records.items()):
-                return
-            directory = workers / task
-            key = task, attempt
-            if key in records and records[key][0].get('pid') != pid:
-                uncertain.append(dict(reason='conflicting_legacy_launch_identity', task_id=task, attempt=attempt))
-                return
-            records[key] = ({**rec, 'attempt': attempt, 'task_id': task,
-                             'boot_id': rec.get('boot_id') or snapshot.get('boot_id')},
-                            directory if directory.is_dir() and not directory.is_symlink() else None)
-
-        for task, rec in _worker_records(snapshot).items():
-            legacy_record(task, rec)
-        try:
-            with (run_dir / 'events.jsonl').open('rb') as stream:
-                for line in stream:
-                    if not line.endswith(b'\n'):
-                        break
-                    try:
-                        event = json.loads(line)
-                    except ValueError:
-                        continue
-                    if isinstance(event, dict) and event.get('event') == 'worker_started':
-                        legacy_record(event.get('task_id'), event)
-        except FileNotFoundError:
-            pass
-        except OSError as exc:
-            uncertain.append(dict(reason='launch_events_unreadable', error=str(exc)))
-    return records, uncertain, 'attempt_journal' if modern else 'legacy_evidence'
+                    uncertain.append(dict(reason='attempt_missing_from_journal', path=str(path)))
+    return records, uncertain, 'attempt_journal'
 
 
 def _root_lock_held(root):
@@ -759,9 +671,6 @@ def _dispatcher_identity(run_dir, status, boot_id):
         return None, False
     for record in (config, submission, status):
         if record and all(_identity(record)):
-            # Historical snapshots may omit boot information that submission has.
-            if submission and _identity(submission) == _identity(record):
-                record = {**submission, **record}
             return record, _live(record, boot_id)
     return None, None
 
@@ -802,7 +711,7 @@ def _stop_dispatcher(run_dir, status, deadline, record, boot_id):
 def _cancel(run_dir, deadline, record, previous):
     boot_id = _boot_id()
     status = _cancel_status(run_dir, boot_id)
-    before, _, _ = _attempt_records(run_dir, status)
+    before, _, _ = _attempt_records(run_dir)
     # Persist known descendants while the dispatcher and CLI can still provide
     # their ancestry. The final scan below includes intents racing with cancel.
     known_live = set()
@@ -816,7 +725,7 @@ def _cancel(run_dir, deadline, record, previous):
             continue
     live = _stop_dispatcher(run_dir, status, deadline, record, boot_id)
     status = _cancel_status(run_dir, boot_id)
-    records, uncertain, evidence = _attempt_records(run_dir, status)
+    records, uncertain, evidence = _attempt_records(run_dir)
     attempts = dict(previous.get('attempts', {}))
     observed = set()
 
@@ -847,16 +756,7 @@ def _cancel(run_dir, deadline, record, previous):
     if live is not False:
         uncertain.append(dict(reason='dispatcher_still_running' if live else 'dispatcher_unverified'))
     clean = not uncertain and all(item['stopped'] for item in attempts.values())
-    # Keep the old task-level display as a projection. It can show only one
-    # attempt per task; the cleanup decision above uses the complete history.
-    workers = {}
-    for item in sorted(attempts.values(), key=lambda item: item['attempt']):
-        sent = {row['signal'] for row in item['signals'] if row['outcome'] == 'sent'}
-        workers[item['task_id']] = dict(pid=item['pid'], process_start_ticks=item['process_start_ticks'],
-                                       term_sent='SIGTERM' in sent, kill_sent='SIGKILL' in sent,
-                                       outcome=('stopped' if item['stopped'] else
-                                                'still_running' if item['remaining'] else 'unverified'))
-    record.update(attempts=attempts, workers=workers, stopped=clean, uncertain=uncertain,
+    record.update(attempts=attempts, stopped=clean, uncertain=uncertain,
                   scope=dict(launch_evidence=evidence, kind='local_linux_procfs',
                              boot_id=boot_id, pid_namespace=os.readlink('/proc/self/ns/pid'),
                              uid=os.geteuid(),
@@ -890,7 +790,7 @@ def cancel(run_dir, wait_seconds=30) -> dict:
     prior = _previous_cleanup(path)
     accepted = task_control.request_cancel(
         run_dir, dict(batch_id=str(run_dir), run_id=run_dir.name,
-                      requested_utc=prior.get('requested_utc') or _stamp(),
+                      requested_utc=_stamp(),
                       reason='user_cancel', cancel_request_path=str(run_dir / 'cancel_request.json')))
     _check_owner(accepted, run_dir)
     base = {**accepted, 'cancel_path': str(path)}

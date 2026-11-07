@@ -21,7 +21,7 @@ class BackgroundIntegrationTests(fixtures.DispatchFixture):
                 self.run_cli('--batch', batch, '--cancel', '--wait-seconds', '4')
         finally:
             # A failed cancellation assertion must not leak the test's detached workers.
-            for path in (self.root / 'workers').glob('*/receipt.json'):
+            for path in (self.root / 'workers').glob('*/receipt-*.json'):
                 try:
                     pid = json.loads(path.read_text()).get('pid')
                     if pid and str(self.root).encode() in Path(f'/proc/{pid}/cmdline').read_bytes():
@@ -43,21 +43,52 @@ class BackgroundIntegrationTests(fixtures.DispatchFixture):
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(result.stdout)
 
-    def test_submit_live_attention_cancel_waiter_and_explicit_cancel(self):
+    def wait_terminal(self, batch):
+        cursor = 0
+        while True:
+            event = self.query(batch, '--wait', '--after', str(cursor), '--wait-seconds', '3')
+            if event['event'] != 'result':
+                self.assertEqual(event['event'], 'terminal', event)
+                return event
+            cursor = event['cursor']
+
+    def test_task_only_submit_and_wait_with_same_directory_finishes_with_summary(self):
+        (self.root / 'COMMON.md').unlink()
+        self.jobs(self.root, ['a', 'b', 'c'])
+        self.behavior(self.root, {'a': 'research', 'b': 'research', 'c': 'research'})
+        self.submit('--ramp-seconds', '0')
+        answers = []
+        while True:
+            # No init command, shared file, batch-handle copy, cursor, or report query.
+            response = self.run_cli('--wait', '--wait-seconds', '3', '--limit', '2')
+            self.assertEqual(response.returncode, 0, response.stderr)
+            event = json.loads(response.stdout)
+            answers.extend(event['items'])
+            if event['event'] == 'terminal':
+                self.assertTrue(event['summary']['ok'])
+                self.assertEqual(event['summary']['counts']['complete'], 3)
+                break
+            self.assertEqual(event['event'], 'result')
+        self.assertEqual({r['id'] for r in answers}, {'a', 'b', 'c'})
+        self.assertEqual(len(answers), 3)
+        self.assertFalse((self.root / 'COMMON.md').exists())
+        self.assertTrue(all('研究已完成' in r['answer'] for r in answers))
+
+    def test_submit_live_result_cancel_waiter_and_explicit_cancel(self):
         self.jobs(self.root, ['a', 'b'])
-        self.behavior(self.root, {'a': 'blocked', 'b': 'hang'})
+        self.behavior(self.root, {'b': 'hang'})
         started = time.monotonic()
         batch = self.submit()['batch_id']
         self.assertLess(time.monotonic() - started, 2)
         event = self.query(batch, '--wait', '--after', '0', '--wait-seconds', '3')
-        self.assertEqual(event['event'], 'attention')
-        self.assertEqual([row['id'] for row in event['items']], ['a'])
+        self.assertEqual(event['event'], 'result')
+        self.assertEqual([(row['id'], row['status'], row['answer']) for row in event['items']],
+                         [('a', 'complete', 'body')])
         self.assertEqual(event['state'], 'running')
         cursor = event['cursor']
-        page = self.query(batch, '--results', '--after', '0')
-        self.assertEqual(page['items'][0]['status'], 'blocked')
         expired = self.query(batch, '--wait', '--after', str(cursor), '--wait-seconds', '.1')
         self.assertTrue(expired['waiting_timed_out'])
+        self.assertEqual(expired['cursor'], cursor)
         self.assertEqual(self.receipt('b')['status'], 'running')
         waiter = subprocess.Popen(self.command(None, '--batch', batch, '--wait', '--after', str(cursor)),
                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -69,13 +100,14 @@ class BackgroundIntegrationTests(fixtures.DispatchFixture):
         cancelled = self.query(batch, '--cancel', '--wait-seconds', '5')
         self.assertTrue(cancelled['stopped'], cancelled)
         self.assertEqual(self.receipt('b')['status'], 'interrupted')
-        after = self.query(batch, '--results', '--after', str(cursor))
+        after = self.query(batch, '--wait', '--after', str(cursor), '--wait-seconds', '3')
+        self.assertEqual(after['event'], 'terminal')
         self.assertEqual([row['id'] for row in after['items']], ['b'])
 
     def test_old_invocation_handle_does_not_cancel_new_retry(self):
         self.behavior(self.root, {'a': 'partial'})
         first = self.submit()['batch_id']
-        self.query(first, '--wait', '--wait-seconds', '3')
+        self.wait_terminal(first)
         self.behavior(self.root, {'a': 'hang'})
         second = self.submit('--retry-failed')['batch_id']
         until = time.monotonic() + 3
@@ -109,7 +141,7 @@ class BackgroundIntegrationTests(fixtures.DispatchFixture):
         self.assertTrue(cancelled['stopped'], cancelled)
         self.behavior(self.root, {})
         resumed = self.submit('--retry-failed')['batch_id']
-        self.query(resumed, '--wait', '--wait-seconds', '3')
+        self.wait_terminal(resumed)
         self.assertTrue(self.query(resumed, '--report')['ok'])
         self.assertEqual(self.receipt()['attempt'], 2)
 

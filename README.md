@@ -20,11 +20,11 @@ Unofficial community tooling; not affiliated with or endorsed by OpenAI. License
 ## 功能
 
 - **独立任务并行执行**：支持批次默认模型与推理强度，任务可以单独覆盖；每次调用显式传入配置。
-- **受控并发与内存门槛**：逐步增加并发，内存不足时暂停新任务。
+- **受控并发与内存门槛**：每批默认最多运行 24 个 EXEC，逐步增加并发，内存不足时暂停启动。
 - **运行目录锁**：防止同一运行目录被重复调度，不同目录可以并行。
 - **逐次尝试记录**：独立保存提示词、日志、回执和结果；输入指纹防止复用错误结果。
 - **有限自动重试**：默认只重试明确的暂时性连接或服务错误；观察到工具执行后停止自动重跑，除非任务显式声明 `retry_safe`。
-- **批次报告**：精简摘要、异常列表、分页结果与完整 JSONL 索引。
+- **增量交付**：逐步收取完整答复，按任务编号记住已交付结果，结束时汇总批次状态。
 - **终端面板**：跨批次切换，查看状态、提示词和最终回答正文；退出面板不会停止任务。
 
 ## 环境要求
@@ -58,16 +58,14 @@ cp "$SKILL/examples/tasks.json" "$RUN/tasks.json"
 先编辑 `$RUN/tasks.json`，将 `YOUR_MODEL_ID` 替换为你可用的模型，再执行：
 
 ```bash
-SUBMISSION=$(python3 "$SKILL/scripts/dispatch.py" --submit --run-dir "$RUN" --concurrency 2)
-printf '%s\n' "$SUBMISSION"
-BATCH=$(printf '%s\n' "$SUBMISSION" | python3 -c 'import json, sys; print(json.load(sys.stdin)["batch_id"])')
+python3 "$SKILL/scripts/dispatch.py" --submit --run-dir "$RUN" --concurrency 2
 ```
 
-`--submit` 启动独立的后台调度进程。保存返回的 `batch_id`（批次目录的绝对路径），后续等待、查询和取消都可用它指定本次调用。`starting` 表示调度器尚未确认就绪；`startup_failed` 时查看返回的 `error` 和 `log_path`。省略 `--submit` 可在前台运行，命令会等到批次结束。
+`--submit` 在后台启动调度并返回 `batch_id`。用同一 `$RUN` 等待最新批次，查询指定批次或取消时使用 `batch_id`。`startup_failed` 时查看 `error` 和 `log_path`。
 
 提交会调用真实模型，使用对应订阅或 API 额度。示例任务只在各自 worker 目录创建小文件。
 
-清单支持对象形式，也兼容完整指定配置的旧式数组：
+清单可使用带 `defaults` 的对象，或直接列出完整配置的任务数组：
 
 ```json
 {
@@ -79,32 +77,33 @@ BATCH=$(printf '%s\n' "$SUBMISSION" | python3 -c 'import json, sys; print(json.l
 }
 ```
 
-修改项目文件时，通过任务的 `write_dirs` 指定已存在的绝对目录，并分配互不重叠的文件。目录写权限不提供工作树隔离或文件锁。worker 不继承主对话，只接收 `COMMON.md` 与自己的提示词。
+修改项目文件时，通过 `write_dirs` 指定已存在的绝对目录，并分配互不重叠的文件。调度器向独立 EXEC 传入任务提示词和可选的 `COMMON.md`，worker 加载适用的项目指令。
 
 ## 查看结果
 
 ```bash
-WAIT_CURSOR=0
-RESULT_CURSOR=0
-python3 "$SKILL/scripts/dispatch.py" --batch "$BATCH" --wait --after "$WAIT_CURSOR" --wait-seconds 60
-python3 "$SKILL/scripts/dispatch.py" --batch "$BATCH" --status
-python3 "$SKILL/scripts/dispatch.py" --batch "$BATCH" --report
-python3 "$SKILL/scripts/dispatch.py" --batch "$BATCH" --results --after "$RESULT_CURSOR" --limit 20
+python3 "$SKILL/scripts/dispatch.py" --run-dir "$RUN" --wait --wait-seconds 60
 ```
 
-`--wait` 在出现待处理项、批次进入终态或等待超时时返回；普通成功不会单独触发返回，等待超时不会停止批次。收到 `terminal` 时查看 `state`，区分正常结束、中断、启动失败和调度器失联。继续等待时，把该命令返回的 `cursor` 赋给 `WAIT_CURSOR`。`--results` 在运行中和结束后都可翻页，可加 `--attention` 只看待处理项；将它返回的 `cursor` 单独赋给 `RESULT_CURSOR`，避免跳过尚未读取的普通成功项。
+重复执行同一条 `--wait` 命令，读取 `items` 中的完整答复，直到 `event: terminal`，再查看 `state` 和已有的 `summary`。调度器按任务编号记录已交付结果。EXEC 以 `status` 和 `answer` 交付，产物路径写在回答正文。
 
-`--run-dir "$RUN" --status` 是按清单查询的兼容入口。它分别报告最近提交（包括启动失败）和当前活跃批次，二者可能不同。用 `--batch "$BATCH"` 可固定查询同一次调用。
+```bash
+python3 "$SKILL/scripts/dispatch.py" --run-dir "$RUN" --status
+python3 "$SKILL/scripts/dispatch.py" --run-dir "$RUN" --report
+python3 "$SKILL/scripts/dispatch.py" --run-dir "$RUN" --results --after 0 --limit 20
+```
 
-批次结束后，`report.json` 提供计数、复用、重试和待处理项概览；`results.jsonl` 保存完整结果与证据路径。**退出码 0 表示命令正常返回；批次 `state: complete` 表示调度结束。** 验收应检查报告的 `ok`、`counts` 和 `attention_count`。如果已核实执行成功，但结果文件缺失或无效，会保留 `execution: succeeded` 并通过 `result_observation` 报告证据问题。这类尝试会进入待处理列表，重试时仍复用已有执行。
+`--results` 可独立分页，用返回的 `cursor` 作为下一页的 `--after`；加 `--attention` 查看待处理项。`report.json` 提供批次统计，`results.jsonl` 保存完整结果与证据路径。验收时查看 `ok`、`counts` 和 `attention_count`。
 
 ## 取消批次
+
+将提交返回的 `batch_id` 保存为 `$BATCH`，取消该次调用：
 
 ```bash
 python3 "$SKILL/scripts/dispatch.py" --batch "$BATCH" --cancel --wait-seconds 60
 ```
 
-取消必须显式指定 `--batch`。命令先保存取消请求并关闭该批次当前拥有的重试计划，再停止调度器和可核实归属的本机进程。检查返回的 `stopped`、`outcome` 和清理范围；若为 `cleanup_pending` 或清理尚未确认，继续用同一句柄查状态和批次目录中的 `cancellation.json`，必要时再次发出取消请求。取消和单次尝试超时共用本机进程归属检查，覆盖仍可识别的独立进程组；远端作业、已发生的外部副作用和无法核实归属的本机进程不在可确认清理的范围内。
+检查返回的 `stopped`、`outcome` 和清理范围；若为 `cleanup_pending`，用同一批次句柄查看状态及 `cancellation.json`。
 
 ## 终端面板
 
@@ -136,7 +135,7 @@ alias codex-parallel-monitor='python3 "$HOME/.codex/skills/codex-parallel/script
 
 如果希望命令名为 `parallel`，请先检查是否已安装同名的 GNU Parallel；本仓库不会覆盖它，也不包含维护者本机的同名包装命令。
 
-面板只是独立观察器，启动失败或退出不影响调度。批次登记存放在 `/run/user/<uid>/codex-parallel`，重启或用户运行时会话被清理后消失。**任务目录内的日志、提示词和产物不会自动删除。**
+同一图形会话复用一个批次总览。批次登记存放在 `/run/user/<uid>/codex-parallel`，日志、提示词和产物保存在任务目录。
 
 ## 继续与重试
 
@@ -144,17 +143,15 @@ alias codex-parallel-monitor='python3 "$HOME/.codex/skills/codex-parallel/script
 python3 "$SKILL/scripts/dispatch.py" --submit --run-dir "$RUN" --only numbers --retry-failed
 ```
 
-再次提交会获得新的 `batch_id`。相同输入会复用已核实的终态；用 `--retry-failed` 可为符合条件的失败、模型声明的 `partial`/`blocked` 或中断任务开启新重试链，前提是确认旧任务已退出且可以安全重做。每次重试都是新的 EXEC，从任务输入开始，保留旧尝试证据。编号回执记录执行事实，兼容指针缺失或过时、崩溃时执行结局未核实，都不会自动授权重跑。
+再次提交会获得新的 `batch_id`，相同输入会复用已核实的终态。确认旧任务已退出且可以安全重做后，`--retry-failed` 可为符合条件的失败、`partial`、`blocked` 或中断任务开启新重试链。新 EXEC 从任务输入开始，保留旧尝试证据。
 
-崩溃后接管待重试的旧链会保留原有预算、策略和退避截止时间；新提交参数只用于新链。主动取消后，普通提交不会恢复已关闭的重试计划；取消旧批次也不会停止已由新批次接管的计划。同一 ID 的提示词或执行配置变化时，应使用新 ID 或新运行目录。
-
-完整参数、自动重试条件、登录通道与产物说明见 [执行参数与产物](references/execution.md)。模型输入可引用的外部文件内容不会自动纳入指纹；外部输入变化时也应使用新的任务 ID 或目录。
+任务输入或执行配置变化时，使用新 ID 或新运行目录。完整参数、恢复条件和产物说明见 [执行参数与产物](references/execution.md)。
 
 ## 登录与数据
 
 默认使用保存的 ChatGPT 登录。只有显式传入 `--channel api` 才从 `~/.config/codexexec/api-key` 读取 API key；不会自动更换通道，也不会修改登录状态。认证文件和密钥应保存在仓库外，不要提交到 Git。
 
-worker 使用 `workspace-write`、`approval_policy="never"`，默认关闭 apps、嵌套多代理、记忆、浏览器、电脑操作和网页搜索。调度器仍会启动真实模型任务，授权范围由你的任务内容及可写目录决定。
+worker 使用 `workspace-write`、`approval_policy="never"`，默认关闭 apps、嵌套多代理、记忆、浏览器、电脑操作和网页搜索。授权使用子代理时，可设置 `multi_agent: true` 并指定 `subagent_model` 和 `subagent_effort`。
 
 ## 测试与开发
 
@@ -162,7 +159,7 @@ worker 使用 `workspace-write`、`approval_policy="never"`，默认关闭 apps�
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_*.py' -v
 ```
 
-当前测试套件共 89 项，使用临时目录、模拟 EXEC 和模拟终端启动器，无需 Codex 登录、API key 或模型调用。覆盖后台提交、取消及本机进程归属、重试链恢复、执行结果与证据的区分、增量分页、计时、面板和规模行为。
+测试使用临时目录、模拟 EXEC 和模拟终端启动器，覆盖后台提交、增量交付、取消、重试链恢复、计时和面板行为。
 
 ## 范围与当前限制
 

@@ -120,8 +120,7 @@ class CancelTests(fixtures.DispatchFixture):
 
         first, _ = attempt(a, 1)
         second, reused = attempt(a, 2)
-        other, latest = attempt(b, 3)
-        write(directory / 'receipt.json', {**latest, 'pid': other.pid})
+        other, _ = attempt(b, 3)
         write(c / 'bindings' / 'a.json', {**reused, 'source': 'reuse'})
 
         consumer = control.cancel(c, 3)

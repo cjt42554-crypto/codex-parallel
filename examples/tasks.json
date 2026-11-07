@@ -1,7 +1,7 @@
 {
   "defaults": {"model": "YOUR_MODEL_ID", "effort": "low"},
   "tasks": [
-    {"id": "numbers", "title": "数字统计", "prompt": "用 Python 计算 1 到 100 的总和及平方和，写入当前工作目录的 numbers.json，校验总和为 5050。完成后按结果 schema 汇报，artifacts 使用绝对路径。"},
-    {"id": "squares", "title": "平方表", "prompt": "用 Python 生成 squares.csv，包含整数 1 到 10 及其平方。重新读取，确认有 10 条数据且最后一项平方为 100。完成后按结果 schema 汇报，artifacts 使用绝对路径。"}
+    {"id": "numbers", "title": "数字统计", "prompt": "用 Python 计算 1 到 100 的总和及平方和，写入当前工作目录的 numbers.json，校验总和为 5050。按结果 schema 汇报，在 answer 中写明产物绝对路径。"},
+    {"id": "squares", "title": "平方表", "prompt": "用 Python 生成 squares.csv，包含整数 1 到 10 及其平方。重新读取，确认有 10 条数据且最后一项平方为 100。按结果 schema 汇报，在 answer 中写明产物绝对路径。"}
   ]
 }

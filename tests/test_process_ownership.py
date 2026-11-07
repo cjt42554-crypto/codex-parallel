@@ -152,6 +152,23 @@ while not Path('release').exists():
         self.assertEqual(result['signals'], [])
         self.assertIsNone(sentinel.poll())
 
+    def test_failed_preparation_without_owner_has_no_process_to_stop(self):
+        receipt = dict(execution='failed', status='failed', reason='launch_failed')
+        result = ownership.terminate_owned(receipt, self.directory, time.monotonic() + .5)
+        self.assertTrue(result['stopped'], result)
+        self.assertEqual(result['signals'], [])
+
+    def test_pid_without_current_owner_does_not_authorize_signaling(self):
+        sentinel = self.spawn()
+        receipt = dict(attempt=1, execution='running', status='running',
+                       pid=sentinel.pid, boot_id=self.owner['boot_id'],
+                       process_start_ticks=str(ownership._process(sentinel.pid).ticks))
+        result = ownership.terminate_owned(receipt, self.directory, time.monotonic() + .5)
+        self.assertFalse(result['stopped'], result)
+        self.assertEqual(result['uncertain'], [{'reason': 'missing_attempt_owner'}])
+        self.assertEqual(result['signals'], [])
+        self.assertIsNone(sentinel.poll())
+
     def test_thread_only_matches_positive_binding_and_cannot_override_owner(self):
         thread = 'worker-test-thread'
         tool = self.spawn(thread=thread)

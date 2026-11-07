@@ -34,9 +34,12 @@ if mode in ('transient','transient_tool','quota'):
  if mode=='transient_tool':print(json.dumps({'type':'item.started','item':{'type':'command_execution'}}),flush=True)
  print(json.dumps({'type':'turn.failed','error':{'code':'insufficient_quota' if mode=='quota' else 'server_is_overloaded'}}),flush=True)
  sys.exit(1)
-result={'status':mode if mode in ('partial','blocked') else 'complete','summary':'body','artifacts':[],'issues':[]}
-if mode=='issues':result['issues']=['needs integration review']
-if mode=='bad_schema':result['artifacts']='wrong'
+result={'status':mode if mode in ('partial','blocked') else 'complete','answer':'body'}
+if mode in ('research','action','simple_partial','simple_blocked'):
+ result={'status':mode.removeprefix('simple_') if mode in ('simple_partial','simple_blocked') else 'complete',
+         'answer':'研究已完成，仅两场历史；未完成真实成交验证。报告：[结果](/not/a/real/artifact.txt)'}
+ if mode=='action':result.update(status='partial',answer='成果待整合，请主会话完成整合。')
+if mode=='bad_schema':result['answer']=['wrong']
 if mode!='missing':Path(args[args.index('-o')+1]).write_text(json.dumps(result))
 print('null',flush=True)
 print(json.dumps({'type':'turn.failed' if mode=='failed_turn' else 'turn.completed'}),flush=True)
@@ -51,7 +54,7 @@ class DispatchFixture(unittest.TestCase):
         self.base = Path(self.temp.name)
         self.scripts = self.base / 'scripts';self.scripts.mkdir()
         shutil.copy2(SOURCE / 'dispatch.py', self.scripts / 'dispatch.py')
-        for helper in ('batch_control.py', 'task_control.py', 'process_ownership.py'):
+        for helper in ('batch_control.py', 'task_control.py', 'process_ownership.py', 'result_contract.py'):
             if (SOURCE / helper).exists():
                 shutil.copy2(SOURCE / helper, self.scripts / helper)
         (self.scripts / 'monitor_registry.py').write_text('from pathlib import Path\ndef registry_directory():\n p=Path('+repr(str(self.base/'registry'))+');p.mkdir(exist_ok=True);return p\n')
@@ -85,7 +88,11 @@ class DispatchFixture(unittest.TestCase):
         return subprocess.run(self.command(root,*extra),capture_output=True,text=True,timeout=20)
 
     def receipt(self,name='a'):
-        return json.loads((self.root/'workers'/name/'receipt.json').read_text())
+        directory = self.root / 'workers' / name
+        path = max(directory.glob('receipt-*.json'), key=lambda p: int(p.stem.removeprefix('receipt-')), default=None)
+        if path is None:
+            raise FileNotFoundError(directory)
+        return json.loads(path.read_text())
 
     def start(self,root=None,*extra):
         p=subprocess.Popen(self.command(root,*extra),stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
@@ -111,6 +118,97 @@ class DispatchTests(DispatchFixture):
             with self.subTest(mutate=mutate):
                 result=self.run_cli();self.assertNotEqual(result.returncode,0);self.assertFalse((self.root/'workers').exists())
         self.jobs(self.root,['a']);self.assertNotEqual(self.run_cli('--only','unknown').returncode,0)
+
+    def test_multi_agent_validation_precedes_launch(self):
+        defaults = dict(model='fake', effort='ultra', multi_agent=True,
+                        subagent_model='child', subagent_effort='high')
+        for field, value in (('multi_agent', 'true'), ('max_subagents', True), ('max_subagents', 0),
+                             ('max_subagents', -1), ('max_subagents', 2.5), ('max_subagents', 2**63),
+                             ('subagent_model', None), ('subagent_effort', None), ('subagent_effort', ' ')):
+            with self.subTest(field=field, value=value):
+                jobs = [dict(id='a', prompt='valid task'), dict(id='b', prompt='bad task', **{field: value})]
+                (self.root/'tasks.json').write_text(json.dumps(dict(defaults=defaults, tasks=jobs)))
+                result = self.run_cli()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f'task b: {field}', result.stderr)
+                self.assertFalse((self.root/'workers').exists())
+        for field in ('subagent_model', 'subagent_effort'):
+            with self.subTest(missing=field):
+                incomplete = {k: v for k, v in defaults.items() if k != field}
+                (self.root/'tasks.json').write_text(json.dumps(dict(defaults=incomplete, tasks=[dict(id='a', prompt='test')])))
+                self.assertIn(f'task a: {field}', self.run_cli('--retry-failed').stderr)
+                self.assertFalse((self.root/'workers').exists())
+
+    def test_multi_agent_worker_defaults_overrides_and_explicit_retry(self):
+        defaults = dict(model='fake', effort='ultra', multi_agent=True,
+                        subagent_model='child', subagent_effort='high')
+        jobs = [dict(id='a', prompt='use inherited settings'),
+                dict(id='b', prompt='use overrides', max_subagents=2, subagent_model='child-2', subagent_effort='ultra'),
+                dict(id='c', prompt='opt out', multi_agent=False)]
+        (self.root/'tasks.json').write_text(json.dumps(dict(defaults=defaults, tasks=jobs)))
+        self.behavior(self.root, {'b': 'partial'})
+        result = self.run_cli()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for name, enabled, limit, model, effort in [('a', True, 3, 'child', 'high'),
+                                                    ('b', True, 2, 'child-2', 'ultra'),
+                                                    ('c', False, None, None, None)]:
+            with self.subTest(name=name):
+                receipt = self.receipt(name)
+                cmd = receipt['command']
+                cfg = {v.split('=', 1)[0]: v.split('=', 1)[1] for v in cmd if v.startswith('agents.')}
+                self.assertEqual(cmd[cmd.index('multi_agent') - 1], '--enable' if enabled else '--disable')
+                self.assertEqual(cfg, {'agents.enabled': 'true',
+                                       'agents.max_concurrent_threads_per_session': str(limit),
+                                       'agents.default_subagent_model': json.dumps(model),
+                                       'agents.default_subagent_reasoning_effort': json.dumps(effort)} if enabled else {})
+                self.assertIn('--ignore-user-config', cmd)
+                self.assertIn('--sub', cmd)
+                self.assertNotIn('--add-dir', cmd)
+                self.assertEqual(cmd[cmd.index('-s') + 1], 'workspace-write')
+                for feature in ('apps', 'memories', 'browser_use', 'computer_use'):
+                    self.assertEqual(cmd[cmd.index(feature) - 1], '--disable')
+                self.assertEqual(receipt['task_timeout_seconds'], 0)
+        partial = self.receipt('b')
+        self.assertEqual(partial['status'], 'partial')
+        self.behavior(self.root, {})
+        result = self.run_cli('--only', 'b', '--retry-failed')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        retried = self.receipt('b')
+        self.assertEqual((retried['attempt'], retried['status']), (2, 'complete'))
+        self.assertEqual(retried['input_fingerprint'], partial['input_fingerprint'])
+        self.assertEqual(retried['command'][:-2], partial['command'][:-2])  # only the numbered output changes
+
+    def test_multi_agent_fingerprint_rejects_changes_but_preserves_opt_out(self):
+        self.assertEqual(self.run_cli().returncode, 0)
+        directory = self.root/'workers/a'
+        original = json.loads((self.root/'tasks.json').read_text())[0]
+        disabled = (directory/'receipt-01.json').read_bytes()
+        agent_config = dict(max_subagents=1, subagent_model='child', subagent_effort='high')
+        (self.root/'tasks.json').write_text(json.dumps([{**original, **agent_config, 'multi_agent': False}]))
+        result = self.run_cli()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((directory/'receipt-01.json').read_bytes(), disabled)
+
+        enabled = {**original, **agent_config, 'multi_agent': True}
+        (self.root/'tasks.json').write_text(json.dumps([enabled]))
+        self.assertIn('inputs/configuration changed', self.run_cli('--retry-failed').stderr)
+        self.assertEqual((directory/'receipt-01.json').read_bytes(), disabled)
+
+        root = self.make_root('enabled')
+        (root/'tasks.json').write_text(json.dumps([enabled]))
+        self.assertEqual(self.run_cli(root=root).returncode, 0)
+        active_directory = root/'workers/a'
+        active = (active_directory/'receipt-01.json').read_bytes()
+        for field, value in [('multi_agent', False), ('max_subagents', 2), ('subagent_model', 'other'), ('subagent_effort', 'ultra')]:
+            with self.subTest(field=field):
+                (root/'tasks.json').write_text(json.dumps([{**enabled, field: value}]))
+                self.assertIn('inputs/configuration changed', self.run_cli('--retry-failed', root=root).stderr)
+                self.assertEqual((active_directory/'receipt-01.json').read_bytes(), active)
+        unverified = json.loads(active)
+        unverified.pop('input_fingerprint')
+        (active_directory/'receipt-01.json').write_text(json.dumps(unverified))
+        (root/'tasks.json').write_text(json.dumps([original]))
+        self.assertIn('cannot be verified', self.run_cli(root=root).stderr)
 
     def test_lock_same_root_other_manifest_and_separate_roots(self):
         self.behavior(self.root,{'a':'slow'});first=self.start();self.wait_started()
@@ -139,18 +237,17 @@ class DispatchTests(DispatchFixture):
     def test_corrupt_receipt_and_unwritable_task_do_not_stop_peers(self):
         self.jobs(self.root,['bad','a','file'])
         w=self.root/'workers';(w/'bad').mkdir(parents=True)
-        (w/'bad/receipt.json').write_text('{corrupt')
+        (w/'bad/receipt-01.json').write_text('{corrupt')
         (w/'file').write_text('not a directory')
         self.assertEqual(self.run_cli().returncode,0)
         self.assertEqual(self.receipt()['status'],'complete')
-        self.assertEqual((w/'bad/receipt.json').read_text(),'{corrupt')
+        self.assertEqual((w/'bad/receipt-01.json').read_text(),'{corrupt')
         self.assertFalse((w/'bad/started').exists())
-        status=json.loads((self.root/'status-tasks.json').read_text())
-        final=json.loads(Path(status['summary_path']).read_text())
-        self.assertEqual(final['results']['bad']['status'],'interrupted')
-        self.assertEqual(final['results']['bad']['recovery_state'],'unknown')
-        self.assertEqual(final['results']['file']['status'],'failed')
-        self.assertIn('receipt_error',final['results']['file'])
+        rows={r['id']:r for r in json.loads(self.run_cli('--results').stdout)['items']}
+        self.assertEqual(rows['bad']['status'],'interrupted')
+        self.assertEqual(rows['bad']['recovery_state'],'unknown')
+        self.assertEqual(rows['file']['status'],'failed')
+        self.assertIn('receipt_error',json.loads(Path(rows['file']['receipt_path']).read_text()))
 
     def test_spawn_failure_is_contained(self):
         # Load the dispatcher and inject one launch error at the actual subprocess boundary.
@@ -176,7 +273,7 @@ class DispatchTests(DispatchFixture):
     def test_status_events_schema_and_timeout(self):
         ids=['a','partial','blocked','failed_turn','both','missing','bad_schema','nonzero','hang']
         self.jobs(self.root,ids);self.behavior(self.root,{i:i for i in ids if i!='a'})
-        self.assertEqual(self.run_cli('--concurrency','9','--ramp-seconds','0','--timeout-seconds','1').returncode,0)
+        self.assertEqual(self.run_cli('--concurrency','9','--ramp-seconds','0','--task-timeout-seconds','1').returncode,0)
         for i in ids:
             expected=i if i in ('partial','blocked') else 'complete' if i=='a' else 'blocked' if i in ('missing','bad_schema') else 'failed'
             with self.subTest(i=i):self.assertEqual(self.receipt(i)['status'],expected)
@@ -193,43 +290,35 @@ class DispatchTests(DispatchFixture):
         self.behavior(self.root,{'a':'nonzero'})
         self.assertEqual(self.run_cli('--retry-failed').returncode,0)
         self.assertEqual(self.receipt()['status'],'failed');self.assertEqual(self.receipt()['result_file'],'result-02.json')
-        self.assertEqual((w/'result-01.json').read_bytes(),original);self.assertFalse((w/'result.json').exists())
+        self.assertEqual((w/'result-01.json').read_bytes(),original)
         self.behavior(self.root,{})
         self.assertEqual(self.run_cli('--retry-failed').returncode,0)
         self.assertEqual(self.receipt()['attempt'],3);self.assertEqual(self.receipt()['status'],'complete')
         self.assertEqual(json.loads((w/'receipt-01.json').read_text())['status'],'partial')
         self.assertEqual(json.loads((w/'receipt-02.json').read_text())['status'],'failed')
+        self.assertFalse((w/'receipt.json').exists())
+        self.assertFalse((w/'result.json').exists())
 
     def test_configuration_changes_refused_without_overwrite(self):
         self.assertEqual(self.run_cli().returncode,0)
-        before=(self.root/'workers/a/receipt.json').read_bytes()
+        before=(self.root/'workers/a/receipt-01.json').read_bytes()
         original=(self.root/'tasks.json').read_text()
         for field,value in [('prompt','changed'),('model','another'),('effort','high'),('web_search','live'),('write_dirs',[str(self.root)])]:
             jobs=json.loads(original);jobs[0][field]=value;(self.root/'tasks.json').write_text(json.dumps(jobs))
             result=self.run_cli('--retry-failed')
             with self.subTest(field=field):self.assertIn('inputs/configuration changed',result.stderr)
-            self.assertEqual((self.root/'workers/a/receipt.json').read_bytes(),before)
+            self.assertEqual((self.root/'workers/a/receipt-01.json').read_bytes(),before)
         (self.root/'tasks.json').write_text(original)
         self.assertIn('inputs/configuration changed',self.run_cli('--channel','api').stderr)
         (self.root/'COMMON.md').write_text('changed')
         self.assertIn('inputs/configuration changed',self.run_cli().stderr)
 
-    def test_legacy_receipt_verification(self):
-        self.assertEqual(self.run_cli().returncode,0)
-        r=self.receipt();r.pop('input_fingerprint');r.pop('result_file')
-        (self.root/'workers/a/receipt-01.json').unlink()
-        (self.root/'workers/a/receipt.json').write_text(json.dumps(r))
-        self.assertEqual(self.run_cli().returncode,0);self.assertEqual(self.receipt()['attempt'],1)
-        r.pop('command');(self.root/'workers/a/receipt.json').write_text(json.dumps(r))
-        self.assertIn('cannot be verified',self.run_cli().stderr)
 
     def test_dashboard_reads_attempt_result_and_summary_failure(self):
         self.jobs(self.root,['a','blocked','file'])
         self.behavior(self.root,{'blocked':'blocked'})
         w=self.root/'workers';w.mkdir();(w/'file').write_text('not a directory')
         self.assertEqual(self.run_cli().returncode,0)
-        # Compatibility file content must not override the result bound to this receipt.
-        (w/'a/result.json').write_text(json.dumps(dict(status='complete',summary='STALE',artifacts=[],issues=[])))
         spec=importlib.util.spec_from_file_location('monitor',SOURCE/'dashboard.py')
         monitor=importlib.util.module_from_spec(spec);spec.loader.exec_module(monitor)
         rows={t['id']:t for t in monitor.snapshot(self.root,'tasks.json')['tasks']}
@@ -266,19 +355,36 @@ class DispatchTests(DispatchFixture):
         for line in result.stdout.splitlines():self.assertIsInstance(json.loads(line),dict)
         again=self.run_cli()
         self.assertIn('历史',again.stderr);self.assertIn('本轮未重跑',again.stderr)
-        status=json.loads((self.root/'status-tasks.json').read_text())
-        final=json.loads(Path(status['summary_path']).read_text())
-        self.assertEqual(final['reused'],['a','blocked','nonzero'])
+        rows=json.loads(self.run_cli('--results').stdout)['items']
+        self.assertEqual(sorted(r['id'] for r in rows if r['reused']),['a','blocked','nonzero'])
 
     def test_report_missing_pid_unstarted_and_multiline_errors(self):
         spec=importlib.util.spec_from_file_location('report_dispatch',self.scripts/'dispatch.py')
         mod=importlib.util.module_from_spec(spec);spec.loader.exec_module(mod)
         jobs=[dict(id='failed',title='启动失败'),dict(id='pending',title='尚未启动')]
-        final=dict(results={'failed':dict(status='failed',last_error='spawn error\nsecond line\x1b')},
-                   summary_path='summary.json')
-        report=mod.format_report(self.root,jobs,final)
+        final=dict(results={'failed': {}}, counts={'failed': 1, 'not_started': 1},
+                   report_path='report.json', results_path='results.jsonl')
+        rows={'failed': dict(status='failed', issues=['spawn error\nsecond line\x1b']),
+              'pending': dict(status='not_started')}
+        report=mod.format_report(jobs,final,rows)
         self.assertIn('启动失败 [failed]',report);self.assertIn('尚未启动 [pending]',report)
         self.assertIn('未启动 1',report);self.assertIn('spawn error second line',report)
         self.assertNotIn('\x1b',report);self.assertIn('—',report)
+
+    def test_report_uses_published_answers_without_reopening_result_files(self):
+        from unittest.mock import patch
+
+        spec=importlib.util.spec_from_file_location('published_report_dispatch',self.scripts/'dispatch.py')
+        mod=importlib.util.module_from_spec(spec);spec.loader.exec_module(mod)
+        jobs=[dict(id='a',title='a'),dict(id='b',title='b')]
+        final=dict(results={'a': dict(pid=12), 'b': dict(pid=34)}, counts={'complete': 1, 'blocked': 1},
+                   report_path='report.json', results_path='results.jsonl')
+        rows={'a': dict(status='complete', answer='routine answer', issues=[]),
+              'b': dict(status='blocked', answer='published answer', issues=['published issue'])}
+        with patch.object(mod,'read_result',side_effect=AssertionError('the report must not reopen results')):
+            report=mod.format_report(jobs,final,rows)
+        self.assertIn('已完成 1，阻塞 1',report)
+        self.assertIn('published answer；published issue',report)
+        self.assertNotIn('routine answer',report)
 
 if __name__=='__main__':unittest.main()

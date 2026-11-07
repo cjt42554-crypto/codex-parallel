@@ -56,10 +56,7 @@ def close(state, reason):
 
 
 def is_cancelled(run_dir):
-    # The legacy cancellation file was also written before signalling. For
-    # newer invocations cancel_request.json is the immutable request.
-    return ((Path(run_dir) / 'cancel_request.json').exists()
-            or (Path(run_dir) / 'cancellation.json').exists())
+    return (Path(run_dir) / 'cancel_request.json').exists()
 
 
 def request_cancel(run_dir, request):
